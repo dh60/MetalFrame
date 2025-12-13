@@ -16,10 +16,37 @@ struct MetalFrame: App {
 
 struct MetalView: View {
     @StateObject private var renderer = Renderer()
+    @State private var mouseHideTimer: Timer?
+    @State private var showProgressBar = false
+    @State private var isImporting = true
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             MetalViewRepresentable(renderer: renderer)
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active:
+                        NSCursor.unhide()
+                        mouseHideTimer?.invalidate()
+                        mouseHideTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { _ in
+                            NSCursor.hide()
+                        }
+                    case .ended:
+                        mouseHideTimer?.invalidate()
+                        NSCursor.unhide()
+                    }
+                }
+            if renderer.duration > 0 {
+                VStack {
+                    Spacer()
+                    ProgressBar(currentTime: $renderer.currentTime, duration: renderer.duration, onSeek: { time in
+                        renderer.seek(to: time)
+                    }, isVisible: $showProgressBar)
+                    .frame(height: 20)
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 10)
+                }
+            }
             if renderer.showInfo {
                 VStack(alignment: .leading) {
                     Text(renderer.info)
@@ -29,6 +56,97 @@ struct MetalView: View {
                 .glassEffect(in: .rect(cornerRadius: 30))
                 .padding()
             }
+        }
+        
+        .focusable()
+        .focusEffectDisabled()
+        .onMoveCommand { direction in
+            switch direction {
+            case .left, .up: renderer.seek(by: -10)
+            case .right, .down: renderer.seek(by: 10)
+            default: break
+            }
+        }
+        .onKeyPress(.space) { renderer.togglePlayback(); return .handled }
+        .onExitCommand { NSApplication.shared.terminate(nil) }
+        .onKeyPress("i") { renderer.showInfo.toggle(); return .handled }
+        .onKeyPress("f") { NSApplication.shared.keyWindow?.toggleFullScreen(nil); return .handled
+        }
+        
+        .fileImporter(
+            isPresented: $isImporting,
+            allowedContentTypes: [.mpeg4Movie],
+            allowsMultipleSelection: false
+        ) { result in
+            let url = try! result.get()[0]
+            renderer.setupVideo(url: url, view: renderer.view!)
+        }
+    }
+}
+
+struct ProgressBar: View {
+    @Binding var currentTime: Double
+    let duration: Double
+    let onSeek: (Double) -> Void
+    @Binding var isVisible: Bool
+    @State private var isDragging = false
+    @State private var dragTime: Double = 0
+
+    func formatTime(_ seconds: Double) -> String {
+        let hours = Int(seconds) / 3600
+        let minutes = Int(seconds) / 60 % 60
+        let secs = Int(seconds) % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, secs)
+        } else {
+            return String(format: "%d:%02d", minutes, secs)
+        }
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Color.clear
+                    .frame(width: geometry.size.width)
+                    .glassEffect()
+                    .opacity(isVisible ? 1 : 0)
+
+                Color.clear
+                    .frame(width: geometry.size.width * CGFloat((isDragging ? dragTime : currentTime) / duration))
+                    .glassEffect(.regular.tint(.purple.opacity(0.1)))
+                    .opacity(isVisible ? 1 : 0)
+
+                if isVisible {
+                    HStack {
+                        Text(formatTime(isDragging ? dragTime : currentTime))
+                        Spacer()
+                        Text(formatTime(duration))
+                    }
+                    .padding(.horizontal, 8)
+                }
+
+                Rectangle()
+                    .fill(Color.clear)
+                    .contentShape(Rectangle())
+            }
+            .onContinuousHover { phase in
+                switch phase {
+                case .active: isVisible = true
+                case .ended: isVisible = false
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        isDragging = true
+                        dragTime = max(0, min(duration, Double(value.location.x / geometry.size.width) * duration))
+                    }
+                    .onEnded { value in
+                        isDragging = false
+                        let newTime = max(0, min(duration, Double(value.location.x / geometry.size.width) * duration))
+                        onSeek(newTime)
+                    }
+            )
         }
     }
 }
@@ -42,22 +160,7 @@ struct MetalViewRepresentable: NSViewRepresentable {
         let view = MTKView()
         view.device = MTLCreateSystemDefaultDevice()
         view.delegate = context.coordinator
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
-            context.coordinator.handleKey($0)
-            return nil
-        }
         context.coordinator.view = view
-
-        DispatchQueue.main.async {
-            let panel = NSOpenPanel()
-            panel.begin { response in
-                guard response == .OK, let url = panel.url else {
-                    NSApp.terminate(nil)
-                    return
-                }
-                context.coordinator.setupVideo(url: url, view: view)
-            }
-        }
 
         return view
     }
@@ -68,28 +171,34 @@ struct MetalViewRepresentable: NSViewRepresentable {
 class Renderer: NSObject, MTKViewDelegate, ObservableObject {
     var device: MTLDevice!
     var queue: MTL4CommandQueue!
-    var upscalePipeline: MTLRenderPipelineState?
-    var downscalePipeline: MTLRenderPipelineState?
+    var renderPipeline: MTLRenderPipelineState?
     var allocator: MTL4CommandAllocator!
     var argumentTable: MTL4ArgumentTable!
     var residencySet: MTLResidencySet!
-    weak var view: MTKView?
     var scaleBuffer: MTLBuffer!
     var compiler: MTL4Compiler!
-    var spatialScaler: MTL4FXSpatialScaler?
-    var scalerOutput: MTLTexture?
-    var lastViewportSize = CGSize.zero
+    var scaler: (MTL4FXSpatialScaler, MTLTexture)?
     var scalerFence: MTLFence!
     var commandBuffer: MTL4CommandBuffer!
+    var player: AVPlayer?
+    var playerItem: AVPlayerItem?
+    var videoOutput: AVPlayerItemVideoOutput?
+    var textureCache: CVMetalTextureCache!
+    var texture: MTLTexture?
+    weak var view: MTKView?
     @Published var info = ""
     @Published var showInfo = false
-    @Published var scalingEnabled = true
+    @Published var scalingEnabled = true {
+        didSet {
+            scaler = nil
+        }
+    }
+    @Published var currentTime: Double = 0
+    @Published var duration: Double = 0
 
-    var player: AVPlayer!
-    var playerItem: AVPlayerItem!
-    var videoOutput: AVPlayerItemVideoOutput!
-    var textureCache: CVMetalTextureCache!
-    var videoTexture: MTLTexture?
+    func seek(to time: Double) { player?.seek(to: CMTime(seconds: time, preferredTimescale: 600)) }
+    func seek(by seconds: Double) { seek(to: (player?.currentTime().seconds ?? 0) + seconds) }
+    func togglePlayback() { player?.rate == 0 ? player?.play() : player?.pause() }
 
     func setupVideo(url: URL, view: MTKView) {
         device = view.device
@@ -97,6 +206,8 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
         compiler = try! device.makeCompiler(descriptor: MTL4CompilerDescriptor())
 
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache)
+
+        view.isPaused = false
 
         let asset = AVURLAsset(url: url)
         playerItem = AVPlayerItem(asset: asset)
@@ -127,16 +238,24 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
         ]
 
         videoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: pixelBufferAttributes)
-        playerItem.add(videoOutput)
+        playerItem!.add(videoOutput!)
 
-        player = AVPlayer(playerItem: playerItem)
+        player = AVPlayer(playerItem: playerItem!)
+
+        Task {
+            if let dur = try? await asset.load(.duration) {
+                await MainActor.run {
+                    self.duration = CMTimeGetSeconds(dur)
+                }
+            }
+        }
 
         let tableDesc = MTL4ArgumentTableDescriptor()
         tableDesc.maxTextureBindCount = 1
         tableDesc.maxBufferBindCount = 1
         argumentTable = try! device.makeArgumentTable(descriptor: tableDesc)
 
-        scaleBuffer = device.makeBuffer(length: 8)
+        scaleBuffer = device.makeBuffer(length: 8, options: .storageModeShared)
         residencySet = try! device.makeResidencySet(descriptor: MTLResidencySetDescriptor())
         allocator = device.makeCommandAllocator()
         scalerFence = device.makeFence()
@@ -152,96 +271,58 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
                 return { float4(positions[vid] * scale, 0, 1), texCoords[vid] };
             }
 
-            fragment half4 passthroughFragment(VertexOut in [[stage_in]], texture2d<half> tex [[texture(0)]]) {
+            fragment half4 fragmentShader(VertexOut in [[stage_in]], texture2d<half> tex [[texture(0)]]) {
                 constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
                 return tex.sample(s, in.texCoord);
             }
 
-            float lanczos(float x, float a) {
-                if (x == 0.0) return 1.0;
-                if (abs(x) >= a) return 0.0;
-                float pi_x = M_PI_F * x;
-                return (a * sin(pi_x) * sin(pi_x / a)) / (pi_x * pi_x);
-            }
 
-            fragment half4 lanczosFragment(VertexOut in [[stage_in]], texture2d<half> tex [[texture(0)]]) {
-                float2 texSize = float2(tex.get_width(), tex.get_height());
-                float2 texelPos = in.texCoord * texSize;
-
-                half4 color = half4(0.0);
-                float totalWeight = 0.0;
-
-                const int radius = 3;
-                for (int y = -radius; y <= radius; y++) {
-                    for (int x = -radius; x <= radius; x++) {
-                        float2 offset = float2(x, y);
-                        float2 centerPos = floor(texelPos) + offset + 0.5;
-                        float2 samplePos = centerPos / texSize;
-                        float2 delta = texelPos - centerPos;
-                        float weight = lanczos(delta.x, 3.0) * lanczos(delta.y, 3.0);
-
-                        constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::nearest);
-                        color += tex.sample(s, samplePos) * weight;
-                        totalWeight += weight;
-                    }
-                }
-
-                return color / totalWeight;
-            }
             """
 
-        device.makeLibrary(source: shaderSource, options: nil) { library, _ in
-            guard let library else { return }
+        device.makeLibrary(source: shaderSource, options: nil) { [weak self] library, error in
+            guard let self = self, let library = library else { return }
 
-            let vertDesc = MTL4LibraryFunctionDescriptor()
-            vertDesc.name = "vertexShader"
-            vertDesc.library = library
-
-            let passthroughFragDesc = MTL4LibraryFunctionDescriptor()
-            passthroughFragDesc.name = "passthroughFragment"
-            passthroughFragDesc.library = library
-
-            let lanczosFragDesc = MTL4LibraryFunctionDescriptor()
-            lanczosFragDesc.name = "lanczosFragment"
-            lanczosFragDesc.library = library
-
-            let upscalePipelineDesc = MTL4RenderPipelineDescriptor()
-            upscalePipelineDesc.vertexFunctionDescriptor = vertDesc
-            upscalePipelineDesc.fragmentFunctionDescriptor = passthroughFragDesc
-            upscalePipelineDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
-
-            let downscalePipelineDesc = MTL4RenderPipelineDescriptor()
-            downscalePipelineDesc.vertexFunctionDescriptor = vertDesc
-            downscalePipelineDesc.fragmentFunctionDescriptor = lanczosFragDesc
-            downscalePipelineDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            let desc = MTL4RenderPipelineDescriptor()
+            desc.vertexFunctionDescriptor = {
+                let d = MTL4LibraryFunctionDescriptor()
+                d.name = "vertexShader"
+                d.library = library
+                return d
+            }()
+            desc.fragmentFunctionDescriptor = {
+                let d = MTL4LibraryFunctionDescriptor()
+                d.name = "fragmentShader"
+                d.library = library
+                return d
+            }()
+            desc.colorAttachments[0].pixelFormat = view.colorPixelFormat
 
             Task {
-                async let upscale = try self.compiler.makeRenderPipelineState(descriptor: upscalePipelineDesc)
-                async let downscale = try self.compiler.makeRenderPipelineState(descriptor: downscalePipelineDesc)
-
-                self.upscalePipeline = try? await upscale
-                self.downscalePipeline = try? await downscale
-                self.player.play()
+                self.renderPipeline = try? await self.compiler.makeRenderPipelineState(descriptor: desc)
+                self.player?.play()
             }
         }
     }
 
     func draw(in view: MTKView) {
-        guard upscalePipeline != nil, downscalePipeline != nil, let drawable = view.currentDrawable else { return }
+        guard renderPipeline != nil, let drawable = view.currentDrawable else { return }
 
-        let time = playerItem.currentTime()
-        if videoOutput.hasNewPixelBuffer(forItemTime: time),
-           let pixelBuffer = videoOutput.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) {
-            var cvMetalTexture: CVMetalTexture?
-            CVMetalTextureCacheCreateTextureFromImage(
-                kCFAllocatorDefault, textureCache, pixelBuffer, nil, .bgra8Unorm,
-                CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer), 0, &cvMetalTexture)
-            if let cvTex = cvMetalTexture {
-                videoTexture = CVMetalTextureGetTexture(cvTex)
+        if let output = videoOutput, let item = playerItem {
+            currentTime = item.currentTime().seconds
+            let time = item.currentTime()
+            if output.hasNewPixelBuffer(forItemTime: time),
+               let pixelBuffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) {
+                var cvMetalTexture: CVMetalTexture?
+                CVMetalTextureCacheCreateTextureFromImage(
+                    kCFAllocatorDefault, textureCache, pixelBuffer, nil, .bgra8Unorm,
+                    CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer), 0, &cvMetalTexture)
+                if let cvTex = cvMetalTexture {
+                    texture = CVMetalTextureGetTexture(cvTex)
+                }
             }
         }
 
-        guard let inputTexture = videoTexture else { return }
+        guard let inputTexture = texture else { return }
 
         let viewportSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
         let imageAspect = CGFloat(inputTexture.width) / CGFloat(inputTexture.height)
@@ -250,8 +331,7 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
             ? CGSize(width: viewportSize.width, height: viewportSize.width / imageAspect)
             : CGSize(width: viewportSize.height * imageAspect, height: viewportSize.height)
 
-        if scalingEnabled && (spatialScaler == nil || lastViewportSize != viewportSize) {
-            lastViewportSize = viewportSize
+        if scalingEnabled && scaler == nil {
             let (outputWidth, outputHeight) = (Int(fitSize.width), Int(fitSize.height))
 
             if outputWidth > inputTexture.width || outputHeight > inputTexture.height,
@@ -265,73 +345,64 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
                 desc.outputTextureFormat = .bgra8Unorm
                 desc.colorProcessingMode = .perceptual
 
-                if let scaler = desc.makeSpatialScaler(device: device, compiler: compiler) {
-                    scaler.fence = scalerFence
-                    spatialScaler = scaler
+                if let s = desc.makeSpatialScaler(device: device, compiler: compiler) {
+                    s.fence = scalerFence
                     let outDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: outputWidth, height: outputHeight, mipmapped: false)
-                    outDesc.usage = scaler.outputTextureUsage
-                    scalerOutput = device.makeTexture(descriptor: outDesc)
+                    outDesc.usage = s.outputTextureUsage
+                    if let outTex = device.makeTexture(descriptor: outDesc) {
+                        scaler = (s, outTex)
+                    }
                 }
-            } else {
-                spatialScaler = nil
-                scalerOutput = nil
             }
-        } else if !scalingEnabled {
-            spatialScaler = nil
-            scalerOutput = nil
         }
 
-        if let scaler = spatialScaler, let output = scalerOutput {
-            scaler.colorTexture = inputTexture
-            scaler.outputTexture = output
-            scaler.inputContentWidth = inputTexture.width
-            scaler.inputContentHeight = inputTexture.height
+        if let (s, output) = scaler {
+            s.colorTexture = inputTexture
+            s.outputTexture = output
+            s.inputContentWidth = inputTexture.width
+            s.inputContentHeight = inputTexture.height
         }
 
-        let renderTexture = (scalingEnabled && spatialScaler != nil) ? scalerOutput! : inputTexture
-        let pipeline: MTLRenderPipelineState
         let scalingMode: String
         let outputSize: CGSize
         if !scalingEnabled {
             scalingMode = "No Scaling"
             outputSize = CGSize(width: inputTexture.width, height: inputTexture.height)
-            pipeline = upscalePipeline!
-        } else if spatialScaler != nil {
+        } else if let (_, output) = scaler {
             scalingMode = "Upscaling: MetalFX"
-            outputSize = fitSize
-            pipeline = upscalePipeline!
+            outputSize = CGSize(width: output.width, height: output.height)
         } else {
-            scalingMode = "Downscaling: Lanczos"
+            scalingMode = "Downscaling: Linear"
             outputSize = fitSize
-            pipeline = downscalePipeline!
         }
 
         info = "Input: \(inputTexture.width)x\(inputTexture.height)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)"
 
-        let scale = scaleBuffer.contents().assumingMemoryBound(to: Float.self)
-        if scalingEnabled {
-            (scale[0], scale[1]) = (Float(fitSize.width / viewportSize.width), Float(fitSize.height / viewportSize.height))
-        } else {
-            (scale[0], scale[1]) = (Float(inputTexture.width) / Float(viewportSize.width), Float(inputTexture.height) / Float(viewportSize.height))
-        }
+        let displaySize = scalingEnabled ? fitSize : CGSize(width: CGFloat(inputTexture.width), height: CGFloat(inputTexture.height))
+
+        scaleBuffer.contents()
+            .assumingMemoryBound(to: SIMD2<Float>.self)
+            .pointee = SIMD2(Float(displaySize.width / viewportSize.width),
+                            Float(displaySize.height / viewportSize.height))
 
         residencySet.removeAllAllocations()
         residencySet.addAllocation(inputTexture)
         residencySet.addAllocation(scaleBuffer)
-        if renderTexture !== inputTexture { residencySet.addAllocation(renderTexture) }
+        if let (_, output) = scaler { residencySet.addAllocation(output) }
         residencySet.commit()
 
-        argumentTable.setTexture(renderTexture.gpuResourceID, index: 0)
+        let finalTexture = scaler?.1 ?? inputTexture
+
+        argumentTable.setTexture(finalTexture.gpuResourceID, index: 0)
         argumentTable.setAddress(scaleBuffer.gpuAddress, index: 0)
 
         commandBuffer.beginCommandBuffer(allocator: allocator)
         commandBuffer.useResidencySet(residencySet)
-
-        if scalingEnabled { spatialScaler?.encode(commandBuffer: commandBuffer) }
+        scaler?.0.encode(commandBuffer: commandBuffer)
 
         let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: view.currentMTL4RenderPassDescriptor!, options: MTL4RenderEncoderOptions())!
-        if scalingEnabled && spatialScaler != nil { encoder.waitForFence(scalerFence, beforeEncoderStages: .fragment) }
-        encoder.setRenderPipelineState(pipeline)
+        if scalingEnabled && scaler != nil { encoder.waitForFence(scalerFence, beforeEncoderStages: .fragment) }
+        encoder.setRenderPipelineState(renderPipeline!)
         encoder.setArgumentTable(argumentTable, stages: [.vertex, .fragment])
         encoder.drawPrimitives(primitiveType: .triangle, vertexStart: 0, vertexCount: 6)
         encoder.endEncoding()
@@ -343,23 +414,7 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
         allocator.reset()
     }
 
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
-
-    func handleKey(_ event: NSEvent) {
-        switch event.keyCode {
-        case 53: NSApp.terminate(nil)
-        case 34: showInfo.toggle()
-        case 49:
-            if player.rate == 0 {
-                player.play()
-            } else {
-                player.pause()
-            }
-        case 123:
-            player.seek(to: CMTime(seconds: max(0, player.currentTime().seconds - 10), preferredTimescale: 600))
-        case 124:
-            player.seek(to: CMTime(seconds: player.currentTime().seconds + 10, preferredTimescale: 600))
-        default: ()
-        }
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        scaler = nil
     }
 }
