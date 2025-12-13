@@ -57,7 +57,14 @@ struct MetalView: View {
                 .padding()
             }
         }
-        
+        .fileImporter(
+            isPresented: $isImporting,
+            allowedContentTypes: [.mpeg4Movie],
+            allowsMultipleSelection: false
+        ) { result in
+            let url = try! result.get()[0]
+            renderer.setupVideo(url: url, view: renderer.view!)
+        }
         .focusable()
         .focusEffectDisabled()
         .onMoveCommand { direction in
@@ -70,17 +77,7 @@ struct MetalView: View {
         .onKeyPress(.space) { renderer.togglePlayback(); return .handled }
         .onExitCommand { NSApplication.shared.terminate(nil) }
         .onKeyPress("i") { renderer.showInfo.toggle(); return .handled }
-        .onKeyPress("f") { NSApplication.shared.keyWindow?.toggleFullScreen(nil); return .handled
-        }
-        
-        .fileImporter(
-            isPresented: $isImporting,
-            allowedContentTypes: [.mpeg4Movie],
-            allowsMultipleSelection: false
-        ) { result in
-            let url = try! result.get()[0]
-            renderer.setupVideo(url: url, view: renderer.view!)
-        }
+        .onKeyPress("f") { NSApplication.shared.keyWindow?.toggleFullScreen(nil); return .handled }
     }
 }
 
