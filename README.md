@@ -8,11 +8,11 @@ A video player for macOS using Metal 4 and MetalFX for high quality playback.
 ## Keybinds
 | Key | Action |
 |-----|--------|
+| Space | Play / Pause |
 | Right / Down | Forward 10s |
 | Left / Up | Back 10s |
-| i | Toggle info overlay |
 | f | Toggle Fullscreen |
-| Space | Play / Pause |
+| i | Toggle info overlay |
 | Esc | Quit |
 ## Info Overlay
 Press `i` to show the info overlay, which displays video details and provides toggles for:
