@@ -1,6 +1,6 @@
 # MetalFrame
 A video player for macOS using Metal 4 and MetalFX for reference playback.
-![MetalFrame User Interface](screenshot.jpg)
+![MetalFrame User Interface](screenshot.png)
 ## Features
 - Plays MPEG-4 videos (.mp4, .m4v)
 - Metal 4 pipeline with reference rendering (no OS scaling, no tone mapping)
