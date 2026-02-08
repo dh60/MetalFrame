@@ -1,9 +1,9 @@
 # MetalFrame
-A video player for macOS using Metal 4 and MetalFX for high quality playback. Only supports HDR video at the moment.
+A video player for macOS using Metal 4 and MetalFX for reference playback.
 ![MetalFrame User Interface](screenshot.png)
 ## Features
-- Plays HDR MPEG-4 videos (.mp4, .m4v)
-- Metal 4 pipeline with reference rendering (no OS scaling, no tonemapping)
+- Plays MPEG-4 videos (.mp4, .m4v)
+- Metal 4 pipeline with reference rendering (no OS scaling, no tone mapping)
 - MetalFX upscaling
 ## Keybinds
 | Key | Action |
