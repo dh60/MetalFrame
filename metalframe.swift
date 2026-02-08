@@ -302,28 +302,29 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
             }
             """
 
-        device.makeLibrary(source: shaderSource, options: nil) { [weak self] library, error in
-            guard let self = self, let library = library else { return }
+        let pixelFormat = view.colorPixelFormat
+        Task {
+            let libDesc = MTL4LibraryDescriptor()
+            libDesc.source = shaderSource
+            let library = try! await self.compiler.makeLibrary(descriptor: libDesc)
 
-            let desc = MTL4RenderPipelineDescriptor()
-            desc.vertexFunctionDescriptor = {
+            let pipelineDesc = MTL4RenderPipelineDescriptor()
+            pipelineDesc.vertexFunctionDescriptor = {
                 let d = MTL4LibraryFunctionDescriptor()
                 d.name = "vertexShader"
                 d.library = library
                 return d
             }()
-            desc.fragmentFunctionDescriptor = {
+            pipelineDesc.fragmentFunctionDescriptor = {
                 let d = MTL4LibraryFunctionDescriptor()
                 d.name = "fragmentShader"
                 d.library = library
                 return d
             }()
-            desc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            pipelineDesc.colorAttachments[0].pixelFormat = pixelFormat
 
-            Task {
-                self.renderPipeline = try? await self.compiler.makeRenderPipelineState(descriptor: desc)
-                self.player?.play()
-            }
+            self.renderPipeline = try? await self.compiler.makeRenderPipelineState(descriptor: pipelineDesc)
+            self.player?.play()
         }
     }
 
