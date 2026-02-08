@@ -206,6 +206,7 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
     var textureCache: CVMetalTextureCache!
     var texture: MTLTexture?
     weak var view: MTKView?
+    var activity: NSObjectProtocol? = ProcessInfo.processInfo.beginActivity(options: .idleDisplaySleepDisabled, reason: "Video playback")
     @Published var info = ""
     @Published var showInfo = false
     @Published var scaleMode: ScaleMode = .fit {
