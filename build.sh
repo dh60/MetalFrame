@@ -27,6 +27,19 @@ cat << EOF > MetalFrame.app/Contents/Info.plist
     <string>en</string>
     <key>LSMinimumSystemVersion</key>
     <string>26.0</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.mpeg-4</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
 EOF

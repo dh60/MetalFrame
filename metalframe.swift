@@ -37,14 +37,27 @@ struct MetalView: View {
                     }
                 }
             if renderer.duration > 0 {
-                VStack {
-                    Spacer()
-                    ProgressBar(currentTime: $renderer.currentTime, duration: renderer.duration, onSeek: { time in
-                        renderer.seek(to: time)
-                    }, isVisible: $showProgressBar)
-                    .frame(height: 20)
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 10)
+                GeometryReader { geo in
+                    VStack {
+                        Spacer()
+                        ZStack(alignment: .bottom) {
+                            Color.clear
+                            ProgressBar(currentTime: $renderer.currentTime, duration: renderer.duration, onSeek: { time in
+                                renderer.seek(to: time)
+                            }, isVisible: $showProgressBar)
+                            .frame(height: 20)
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 10)
+                        }
+                        .frame(height: geo.size.height * 0.05)
+                        .contentShape(Rectangle())
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case .active: showProgressBar = true
+                            case .ended: showProgressBar = false
+                            }
+                        }
+                    }
                 }
             }
             if renderer.showInfo {
@@ -63,6 +76,10 @@ struct MetalView: View {
             allowsMultipleSelection: false
         ) { result in
             let url = try! result.get()[0]
+            renderer.setupVideo(url: url, view: renderer.view!)
+        }
+        .onOpenURL { url in
+            isImporting = false
             renderer.setupVideo(url: url, view: renderer.view!)
         }
         .focusable()
@@ -126,12 +143,6 @@ struct ProgressBar: View {
                     .fill(Color.clear)
                     .contentShape(Rectangle())
             }
-            .onContinuousHover { phase in
-                switch phase {
-                case .active: isVisible = true
-                case .ended: isVisible = false
-                }
-            }
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { value in
@@ -156,6 +167,7 @@ struct MetalViewRepresentable: NSViewRepresentable {
     func makeNSView(context: Context) -> MTKView {
         let view = MTKView()
         view.device = MTLCreateSystemDefaultDevice()
+        view.colorPixelFormat = .rgba16Float
         view.delegate = context.coordinator
         context.coordinator.view = view
 
@@ -204,33 +216,19 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
 
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache)
 
+        scaler = nil
         view.isPaused = false
+
+        if let metalLayer = view.layer as? CAMetalLayer {
+            metalLayer.wantsExtendedDynamicRangeContent = true
+            metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+        }
 
         let asset = AVURLAsset(url: url)
         playerItem = AVPlayerItem(asset: asset)
 
-        Task {
-            if let tracks = try? await asset.load(.tracks),
-               let videoTrack = tracks.first(where: { $0.mediaType == .video }),
-               let formatDescs = try? await videoTrack.load(.formatDescriptions),
-               let formatDesc = formatDescs.first as CFTypeRef?,
-               let extensions = CMFormatDescriptionGetExtensions(formatDesc as! CMFormatDescription) as? [String: Any],
-               let transferFunction = extensions[kCVImageBufferTransferFunctionKey as String] as? String,
-               (transferFunction == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String ||
-                transferFunction == kCVImageBufferTransferFunction_ITU_R_2100_HLG as String) {
-                await MainActor.run {
-                    if let metalLayer = view.layer as? CAMetalLayer {
-                        metalLayer.wantsExtendedDynamicRangeContent = true
-                        if let colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ) {
-                            metalLayer.colorspace = colorspace
-                        }
-                    }
-                }
-            }
-        }
-
         let pixelBufferAttributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBAHalf,
             kCVPixelBufferMetalCompatibilityKey as String: true
         ]
 
@@ -272,8 +270,6 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
                 constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
                 return tex.sample(s, in.texCoord);
             }
-
-
             """
 
         device.makeLibrary(source: shaderSource, options: nil) { [weak self] library, error in
@@ -311,7 +307,7 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
                let pixelBuffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) {
                 var cvMetalTexture: CVMetalTexture?
                 CVMetalTextureCacheCreateTextureFromImage(
-                    kCFAllocatorDefault, textureCache, pixelBuffer, nil, .bgra8Unorm,
+                    kCFAllocatorDefault, textureCache, pixelBuffer, nil, .rgba16Float,
                     CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer), 0, &cvMetalTexture)
                 if let cvTex = cvMetalTexture {
                     texture = CVMetalTextureGetTexture(cvTex)
@@ -338,13 +334,13 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
                 desc.inputHeight = inputTexture.height
                 desc.outputWidth = outputWidth
                 desc.outputHeight = outputHeight
-                desc.colorTextureFormat = .bgra8Unorm
-                desc.outputTextureFormat = .bgra8Unorm
+                desc.colorTextureFormat = .rgba16Float
+                desc.outputTextureFormat = .rgba16Float
                 desc.colorProcessingMode = .perceptual
 
                 if let s = desc.makeSpatialScaler(device: device, compiler: compiler) {
                     s.fence = scalerFence
-                    let outDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: outputWidth, height: outputHeight, mipmapped: false)
+                    let outDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: outputWidth, height: outputHeight, mipmapped: false)
                     outDesc.usage = s.outputTextureUsage
                     if let outTex = device.makeTexture(descriptor: outDesc) {
                         scaler = (s, outTex)
