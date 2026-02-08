@@ -63,7 +63,12 @@ struct MetalView: View {
             if renderer.showInfo {
                 VStack(alignment: .leading) {
                     Text(renderer.info)
-                    Toggle("Scaling", isOn: $renderer.scalingEnabled)
+                    Picker("Scale", selection: $renderer.scaleMode) {
+                        ForEach(ScaleMode.allCases, id: \.self) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
                 }
                 .padding()
                 .glassEffect(in: .rect(cornerRadius: 30))
@@ -177,6 +182,12 @@ struct MetalViewRepresentable: NSViewRepresentable {
     func updateNSView(_ nsView: MTKView, context: Context) {}
 }
 
+enum ScaleMode: String, CaseIterable {
+    case off = "Off"
+    case fit = "Fit"
+    case fill = "Fill"
+}
+
 class Renderer: NSObject, MTKViewDelegate, ObservableObject {
     var device: MTLDevice!
     var queue: MTL4CommandQueue!
@@ -197,13 +208,14 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
     weak var view: MTKView?
     @Published var info = ""
     @Published var showInfo = false
-    @Published var scalingEnabled = true {
+    @Published var scaleMode: ScaleMode = .fit {
         didSet {
             scaler = nil
         }
     }
     @Published var currentTime: Double = 0
     @Published var duration: Double = 0
+    @Published var colorspaceLabel = "sRGB"
 
     func seek(to time: Double) { player?.seek(to: CMTime(seconds: time, preferredTimescale: 600)) }
     func seek(by seconds: Double) { seek(to: (player?.currentTime().seconds ?? 0) + seconds) }
@@ -220,8 +232,7 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
         view.isPaused = false
 
         if let metalLayer = view.layer as? CAMetalLayer {
-            metalLayer.wantsExtendedDynamicRangeContent = true
-            metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+            metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         }
 
         let asset = AVURLAsset(url: url)
@@ -241,6 +252,24 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
             if let dur = try? await asset.load(.duration) {
                 await MainActor.run {
                     self.duration = CMTimeGetSeconds(dur)
+                }
+            }
+            if let tracks = try? await asset.load(.tracks),
+               let videoTrack = tracks.first(where: { $0.mediaType == .video }),
+               let descs = try? await videoTrack.load(.formatDescriptions) {
+                let isHDR = descs.contains { desc in
+                    let exts = CMFormatDescriptionGetExtensions(desc) as? [String: Any]
+                    let tf = exts?[kCVImageBufferTransferFunctionKey as String] as? String
+                    return tf == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
+                }
+                if isHDR {
+                    await MainActor.run {
+                        if let metalLayer = view.layer as? CAMetalLayer {
+                            metalLayer.wantsExtendedDynamicRangeContent = true
+                            metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+                        }
+                        self.colorspaceLabel = "BT.2100 PQ"
+                    }
                 }
             }
         }
@@ -320,12 +349,21 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
         let viewportSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
         let imageAspect = CGFloat(inputTexture.width) / CGFloat(inputTexture.height)
         let viewportAspect = viewportSize.width / viewportSize.height
-        let fitSize = imageAspect > viewportAspect
-            ? CGSize(width: viewportSize.width, height: viewportSize.width / imageAspect)
-            : CGSize(width: viewportSize.height * imageAspect, height: viewportSize.height)
 
-        if scalingEnabled && scaler == nil {
-            let (outputWidth, outputHeight) = (Int(fitSize.width), Int(fitSize.height))
+        let targetSize: CGSize
+        switch scaleMode {
+        case .fit:
+            targetSize = imageAspect > viewportAspect
+                ? CGSize(width: viewportSize.width, height: viewportSize.width / imageAspect)
+                : CGSize(width: viewportSize.height * imageAspect, height: viewportSize.height)
+        case .fill:
+            targetSize = CGSize(width: viewportSize.height * imageAspect, height: viewportSize.height)
+        case .off:
+            targetSize = CGSize(width: CGFloat(inputTexture.width), height: CGFloat(inputTexture.height))
+        }
+
+        if scaleMode != .off && scaler == nil {
+            let (outputWidth, outputHeight) = (Int(targetSize.width), Int(targetSize.height))
 
             if outputWidth > inputTexture.width || outputHeight > inputTexture.height,
                MTLFXSpatialScalerDescriptor.supportsDevice(device) {
@@ -358,7 +396,7 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
 
         let scalingMode: String
         let outputSize: CGSize
-        if !scalingEnabled {
+        if scaleMode == .off {
             scalingMode = "No Scaling"
             outputSize = CGSize(width: inputTexture.width, height: inputTexture.height)
         } else if let (_, output) = scaler {
@@ -366,17 +404,15 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
             outputSize = CGSize(width: output.width, height: output.height)
         } else {
             scalingMode = "Downscaling: Linear"
-            outputSize = fitSize
+            outputSize = targetSize
         }
 
-        info = "Input: \(inputTexture.width)x\(inputTexture.height)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)"
-
-        let displaySize = scalingEnabled ? fitSize : CGSize(width: CGFloat(inputTexture.width), height: CGFloat(inputTexture.height))
+        info = "Input: \(inputTexture.width)x\(inputTexture.height)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)\nColorspace: \(colorspaceLabel)"
 
         scaleBuffer.contents()
             .assumingMemoryBound(to: SIMD2<Float>.self)
-            .pointee = SIMD2(Float(displaySize.width / viewportSize.width),
-                            Float(displaySize.height / viewportSize.height))
+            .pointee = SIMD2(Float(targetSize.width / viewportSize.width),
+                            Float(targetSize.height / viewportSize.height))
 
         residencySet.removeAllAllocations()
         residencySet.addAllocation(inputTexture)
@@ -394,7 +430,7 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject {
         scaler?.0.encode(commandBuffer: commandBuffer)
 
         let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: view.currentMTL4RenderPassDescriptor!, options: MTL4RenderEncoderOptions())!
-        if scalingEnabled && scaler != nil { encoder.waitForFence(scalerFence, beforeEncoderStages: .fragment) }
+        if scaleMode != .off && scaler != nil { encoder.waitForFence(scalerFence, beforeEncoderStages: .fragment) }
         encoder.setRenderPipelineState(renderPipeline!)
         encoder.setArgumentTable(argumentTable, stages: [.vertex, .fragment])
         encoder.drawPrimitives(primitiveType: .triangle, vertexStart: 0, vertexCount: 6)
