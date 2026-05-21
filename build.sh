@@ -1,11 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 # Clean build
 rm -rf MetalFrame.app
 
 # Create the app bundle structure first
 mkdir -p MetalFrame.app/Contents/MacOS
 
-# Compile the Swift code
-swiftc metalframe.swift -o MetalFrame.app/Contents/MacOS/MetalFrame -framework SwiftUI -framework Metal -framework MetalKit -framework MetalFX -framework AVFoundation -framework CoreVideo -parse-as-library
+# Compile the Swift code + link
+swiftc metalframe.swift \
+    -o MetalFrame.app/Contents/MacOS/MetalFrame \
+    -framework SwiftUI -framework Metal -framework MetalKit \
+    -framework MetalFX -framework AVFoundation -framework CoreVideo \
+    -parse-as-library
 
 # Create Info.plist
 cat << EOF > MetalFrame.app/Contents/Info.plist
@@ -37,6 +44,7 @@ cat << EOF > MetalFrame.app/Contents/Info.plist
             <key>LSItemContentTypes</key>
             <array>
                 <string>public.mpeg-4</string>
+                <string>public.movie</string>
             </array>
         </dict>
     </array>
@@ -44,6 +52,6 @@ cat << EOF > MetalFrame.app/Contents/Info.plist
 </plist>
 EOF
 
-codesign --force --deep --sign - MetalFrame.app
+codesign --force --sign - MetalFrame.app
 
 echo "Build complete!"
