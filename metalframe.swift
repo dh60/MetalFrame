@@ -1,4 +1,5 @@
 import SwiftUI
+import Observation
 import Metal
 import MetalKit
 import MetalFX
@@ -30,12 +31,13 @@ struct MetalFrame: App {
 }
 
 struct MetalView: View {
-    @StateObject private var renderer = Renderer()
+    @State private var renderer = Renderer()
     @State private var mouseHideTimer: Timer?
     @State private var showProgressBar = false
     @State private var showStatusOverlay = false
     @State private var statusTimer: Timer?
-    @State private var isImporting = true
+    @State private var isImporting = false
+    @State private var didReceiveURL = false
 
     func flashStatusOverlay() {
         withAnimation { showStatusOverlay = true }
@@ -46,6 +48,7 @@ struct MetalView: View {
     }
 
     var body: some View {
+        @Bindable var renderer = renderer
         ZStack(alignment: .topLeading) {
             MetalViewRepresentable(renderer: renderer)
             if renderer.duration > 0 {
@@ -138,7 +141,10 @@ struct MetalView: View {
         }
         .fileImporter(
             isPresented: $isImporting,
-            allowedContentTypes: [.movie],
+            // .movie covers registered formats; MKV only conforms to public.movie
+            // when some installed app declares it, so also pass our imported UTI
+            // (declared in Info.plist) to keep .mkv selectable on clean systems.
+            allowedContentTypes: [.movie] + (UTType("org.matroska.mkv").map { [$0] } ?? []),
             allowsMultipleSelection: false
         ) { result in
             switch result {
@@ -150,12 +156,20 @@ struct MetalView: View {
             }
         }
         .onOpenURL { url in
+            didReceiveURL = true
             isImporting = false
             guard let view = renderer.view else { return }
             renderer.setupVideo(url: url, view: view)
         }
         .onReceive(NotificationCenter.default.publisher(for: .openFileRequested)) { _ in
             isImporting = true
+        }
+        .task {
+            // Give onOpenURL (Finder double-click / `open` from Terminal) a chance
+            // to fire before falling back to the file picker. Without this delay
+            // the picker would briefly appear and then dismiss when the URL arrives.
+            try? await Task.sleep(for: .milliseconds(200))
+            if !didReceiveURL { isImporting = true }
         }
         .focusable()
         .focusEffectDisabled()
@@ -292,6 +306,13 @@ struct MetalViewRepresentable: NSViewRepresentable {
         view.device = MTLCreateSystemDefaultDevice()
         view.colorPixelFormat = .rgba16Float
         view.delegate = context.coordinator
+        // Drive draws ourselves from a NSScreen-bound CADisplayLink so we can use
+        // its targetTimestamp for both AVPlayerItemVideoOutput.itemTime(forHostTime:)
+        // and CAMetalDrawable.present(atTime:) — vsync-aligned frame pull and
+        // presentation. MTKView's built-in display loop only exposes a coarse
+        // preferredFramesPerSecond knob.
+        view.isPaused = true
+        view.enableSetNeedsDisplay = false
         context.coordinator.view = view
 
         return view
@@ -318,7 +339,8 @@ enum TransferFunction: Int32 {
     case hlg = 3
 }
 
-class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegibleOutputPushDelegate {
+@Observable
+class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate {
     var device: MTLDevice!
     var queue: MTL4CommandQueue!
     var renderPipelineIntake: MTLRenderPipelineState?
@@ -331,11 +353,21 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
     var intakeUniformsBuffer: MTLBuffer!
     var compiler: MTL4Compiler!
     var scaler: (MTL4FXSpatialScaler, MTLTexture)?
-    var scalerFence: MTLFence!
     var intakeFence: MTLFence!
     var kernelLUT: MTLTexture!
     var transferFunction: TransferFunction = .sRGB
+    var isHDR: Bool = false
     var ycbcrMatrix: simd_float3x3 = matrix_identity_float3x3
+    // Display-side orientation derived from the source track's preferredTransform.
+    // rotationQuadrant ∈ {0, 1, 2, 3} = {0°, 90° CW, 180°, 270° CW}. rotation maps
+    // display-space texCoord (centered at 0.5) back into source space, so the
+    // intake pass samples the unrotated source planes while writing a display-
+    // oriented intermediate. displayAspect bakes in both rotation and pixel
+    // aspect ratio for the final fit/fill quad; 0 = not yet known (track metadata
+    // loads async), in which case draw() falls back to the texture's own aspect.
+    var rotationQuadrant: Int = 0
+    var rotation: simd_float2x2 = matrix_identity_float2x2
+    var displayAspect: CGFloat = 0
     var commandBuffer: MTL4CommandBuffer!
     var frameEvent: MTLSharedEvent!
     var pendingFrameValue: UInt64 = 0
@@ -346,38 +378,53 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
     var yTexture: MTLTexture?
     var cbcrTexture: MTLTexture?
     var linearTexture: MTLTexture?
-    var didInspectFormat = false
+    var lastPixelFormat: OSType = 0
     // Cached strong refs to the CVMetalTextures backing yTexture / cbcrTexture for
     // the current frame — if these go out of scope, the MTLTextures stop being
     // valid views into the underlying IOSurface.
     var ySource: CVMetalTexture?
     var cbcrSource: CVMetalTexture?
     weak var view: MTKView?
-    var activity: NSObjectProtocol? = ProcessInfo.processInfo.beginActivity(options: .idleDisplaySleepDisabled, reason: "Video playback")
+    var activity: NSObjectProtocol?
     var remuxedUrl: URL?
     var currentSetupTask: Task<Void, Never>?
     var pendingSeekTime: Double?
     var isSeeking = false
-    @Published var info = ""
-    @Published var showInfo = false
-    @Published var scaleMode: ScaleMode = .fit {
+    var info = ""
+    var showInfo = false
+    var scaleMode: ScaleMode = .fit {
         didSet {
             scaler = nil
         }
     }
-    @Published var currentTime: Double = 0
-    @Published var duration: Double = 0
-    @Published var colorspaceLabel = "sRGB"
-    @Published var isRemuxing = false
-    @Published var subtitleText = ""
-    @Published var statusLabel = ""
-    @Published var selectedSubtitleIndex = -1
-    @Published var errorMessage: String?
+    var currentTime: Double = 0
+    var duration: Double = 0
+    var colorspaceLabel = "sRGB"
+    var isRemuxing = false
+    var subtitleText = ""
+    var statusLabel = ""
+    var selectedSubtitleIndex = -1
+    var errorMessage: String?
     var subtitleOptions: [AVMediaSelectionOption] = []
     var subtitleGroup: AVMediaSelectionGroup?
     var legibleOutput: AVPlayerItemLegibleOutput?
     var didSetColorSpace = false
     var scalerColorMode: MTLFXSpatialScalerColorProcessingMode = .perceptual
+    var itemStatusObservation: NSKeyValueObservation?
+    var endObservation: NSObjectProtocol?
+    var displayLink: CADisplayLink?
+    // Render-rate + drop accounting for the info overlay. FPS is presented frames
+    // over a ~0.5s sliding window. Drops are detected from gaps between the PTS of
+    // consecutively pulled video frames — that catches frames that went by without
+    // being displayed whether decode or render was late. lastPulledItemTime = -1 is
+    // a sentinel meaning "don't judge the next gap" (fresh video, seek, loop).
+    var measuredFPS: Double = 0
+    var fpsFrameCount = 0
+    var fpsWindowStart: CFTimeInterval = 0
+    var droppedFrames = 0
+    var lastPulledItemTime: Double = -1
+    var nextOutputHostTime: CFTimeInterval = 0
+    var screenObservation: NSObjectProtocol?
 
     // Compare CFString names directly against CGColorSpace constants — substring
     // matching on `cs.name` was broken because the runtime returns e.g.
@@ -405,7 +452,63 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
     deinit {
         currentSetupTask?.cancel()
         cleanupRemux()
+        displayLink?.invalidate()
+        if let screenObservation { NotificationCenter.default.removeObserver(screenObservation) }
+        if let endObservation { NotificationCenter.default.removeObserver(endObservation) }
         if let activity { ProcessInfo.processInfo.endActivity(activity) }
+    }
+
+    // Hold the idle-sleep assertion only while actually playing — a paused player
+    // shouldn't keep the display awake indefinitely.
+    func setPlaybackActivity(_ playing: Bool) {
+        if playing, activity == nil {
+            activity = ProcessInfo.processInfo.beginActivity(options: .idleDisplaySleepDisabled, reason: "Video playback")
+        } else if !playing, let activity {
+            ProcessInfo.processInfo.endActivity(activity)
+            self.activity = nil
+        }
+    }
+
+    // Attach (or re-attach) a CADisplayLink bound to the view's current screen.
+    // Called after the view is in a window and on screen changes — the link is
+    // screen-specific, so dragging the window to a 60Hz panel from a 120Hz panel
+    // must rebuild it to get the new vsync cadence.
+    @MainActor
+    func ensureDisplayLink(view: MTKView, preferredFPS: Int? = nil) {
+        let screen = view.window?.screen ?? NSScreen.main
+        guard let screen else { return }
+        displayLink?.invalidate()
+        let link = screen.displayLink(target: self, selector: #selector(displayLinkFired(_:)))
+        if let fps = preferredFPS, fps > 0 {
+            // Lock the link to the content rate so VRR/ProMotion panels can drop to
+            // the content frame rate (e.g., 120Hz panel → 24Hz refresh for 24fps film).
+            let f = Float(fps)
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: f, maximum: f, preferred: f)
+        }
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+
+        if screenObservation == nil, let window = view.window {
+            screenObservation = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeScreenNotification,
+                object: window,
+                queue: .main
+            ) { [weak self, weak view] _ in
+                guard let self, let view else { return }
+                // Delivered on .main (see queue: above), so we're already on the main
+                // actor — assert it so the @MainActor call is statically legal.
+                MainActor.assumeIsolated {
+                    self.ensureDisplayLink(view: view, preferredFPS: self.contentFPS)
+                }
+            }
+        }
+    }
+
+    var contentFPS: Int?
+
+    @objc func displayLinkFired(_ link: CADisplayLink) {
+        nextOutputHostTime = link.targetTimestamp
+        view?.draw()
     }
 
     func cleanupRemux() {
@@ -516,7 +619,9 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
 
         ycbcrMatrix = m
 
-        // Layout matches shader IntakeUniforms exactly.
+        // Layout matches shader IntakeUniforms exactly: float3x3 (48, columns padded
+        // to 16) + 3× float2 (24) + float2x2 (16, 8-aligned at offset 72) + tf + pad
+        // = 96 bytes.
         let p = intakeUniformsBuffer.contents()
         p.assumingMemoryBound(to: simd_float3x3.self).pointee = m
         let offset0 = MemoryLayout<simd_float3x3>.size
@@ -524,8 +629,10 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
         f[0] = yScale;       f[1] = yBias
         f[2] = cScale;       f[3] = cBias
         f[4] = chromaOffset.x; f[5] = chromaOffset.y
-        f[6] = Float(transferFunction.rawValue)
-        f[7] = 0
+        f[6] = rotation.columns.0.x; f[7] = rotation.columns.0.y
+        f[8] = rotation.columns.1.x; f[9] = rotation.columns.1.y
+        f[10] = Float(transferFunction.rawValue)
+        f[11] = 0
     }
 
     func cycleSubtitles() {
@@ -551,6 +658,7 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
         let clamped = max(0, min(duration, time))
         pendingSeekTime = clamped
         isSeeking = true
+        lastPulledItemTime = -1
         let target = CMTime(seconds: clamped, preferredTimescale: 600)
         player?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             guard let self else { return }
@@ -566,7 +674,16 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
         seek(to: current + seconds)
     }
 
-    func togglePlayback() { player?.rate == 0 ? player?.play() : player?.pause() }
+    func togglePlayback() {
+        guard let player else { return }
+        if player.rate == 0 {
+            player.play()
+            setPlaybackActivity(true)
+        } else {
+            player.pause()
+            setPlaybackActivity(false)
+        }
+    }
 
     func setupVideo(url: URL, view: MTKView) {
         currentSetupTask?.cancel()
@@ -655,11 +772,18 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ffmpegPath)
 
-        var args = ["-i", url.path, "-map", "0:v", "-map", "0:a?"]
+        // 0:V (capital) selects real video streams only — attached cover art
+        // (mjpeg attached_pic) would otherwise be muxed as a video track and can
+        // abort the MP4 muxer.
+        var args = ["-i", url.path, "-map", "0:V?", "-map", "0:a?"]
         for i in textSubtitleStreamIndices { args += ["-map", "0:s:\(i)"] }
         args += ["-c:v", "copy", "-c:a", canCopyAudio ? "copy" : "alac"]
         if !textSubtitleStreamIndices.isEmpty { args += ["-c:s", "mov_text"] }
         if isHEVC { args += ["-tag:v", "hvc1"] }
+        // TrueHD/Atmos (and a few other codecs) are flagged "experimental" by the MP4
+        // muxer, so a straight -c copy aborts header write with ffmpeg exit code 88.
+        // Lower the muxer's strictness so those streams can be carried unchanged.
+        args += ["-strict", "experimental"]
         args += ["-ignore_unknown", "-copyts", outputUrl.path, "-y"]
         process.arguments = args
 
@@ -672,9 +796,14 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
             try? fileManager.removeItem(at: outputUrl)
         }
 
+        // Don't block the cooperative pool thread with waitUntilExit — pipe through
+        // terminationHandler so the Task suspends while ffmpeg works (which can take
+        // many seconds for large MKVs) and resumes when it exits.
         do {
             try process.run()
-            process.waitUntilExit()
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                process.terminationHandler = { _ in continuation.resume() }
+            }
             try? logHandle?.close()
         } catch {
             cleanupTempFiles()
@@ -702,6 +831,7 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
         return outputUrl
     }
 
+    @MainActor
     func setupVideoPipeline(url: URL, view: MTKView) {
         device = view.device
         queue = device.makeMTL4CommandQueue()
@@ -723,16 +853,50 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
 
         scaler = nil
         didSetColorSpace = false
-        didInspectFormat = false
+        lastPixelFormat = 0
+        rotationQuadrant = 0
+        rotation = matrix_identity_float2x2
+        displayAspect = 0
         yTexture = nil
         cbcrTexture = nil
         linearTexture = nil
         ySource = nil
         cbcrSource = nil
-        view.isPaused = false
+
+        // Spin up the display link now (before the async track-fps fetch completes)
+        // so we start ticking and can render the first frames as soon as the player
+        // is ready. Frame-rate range gets refined once we know the source fps.
+        ensureDisplayLink(view: view, preferredFPS: nil)
 
         let asset = AVURLAsset(url: url)
         playerItem = AVPlayerItem(asset: asset)
+
+        // Surface unplayable formats (.webm, .avi, broken codec, etc.) instead of a
+        // silent black screen. AVPlayerItem.status transitions to .failed when the
+        // asset can't be loaded; .error carries the diagnostic.
+        itemStatusObservation = playerItem?.observe(\.status, options: [.new]) { [weak self] item, _ in
+            guard let self, item.status == .failed else { return }
+            let msg = item.error?.localizedDescription ?? "Unknown decode error"
+            Task { @MainActor in self.errorMessage = "Cannot play this file: \(msg)" }
+        }
+
+        // At end of playback, rewind and pause so Space replays from the start
+        // (and the idle-sleep assertion is released while we sit on the end frame).
+        if let endObservation { NotificationCenter.default.removeObserver(endObservation) }
+        endObservation = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: playerItem,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            MainActor.assumeIsolated {
+                self.player?.pause()
+                self.player?.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+                self.currentTime = 0
+                self.lastPulledItemTime = -1
+                self.setPlaybackActivity(false)
+            }
+        }
 
         // Bi-planar YUV intake. CVPixelBuffer.h:232 says the format-type key takes a
         // CFArray of CFNumbers, so AVF picks the closest match to the source — we
@@ -766,20 +930,75 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
         subtitleGroup = nil
         currentTime = 0
         pendingSeekTime = nil
+        measuredFPS = 0
+        fpsFrameCount = 0
+        fpsWindowStart = 0
+        droppedFrames = 0
+        lastPulledItemTime = -1
 
         Task { [weak self] in
             guard let self else { return }
             if let dur = try? await asset.load(.duration) {
                 await MainActor.run { self.duration = CMTimeGetSeconds(dur) }
             }
-            // Match the view's redraw cadence to the source frame rate so 24/25/30
-            // fps content doesn't get repeated unevenly. On ProMotion/VRR panels
-            // this lets the display lock to the content rate (no judder); on fixed
-            // 60 Hz panels 24-on-60 cadence is still hardware-bound. MTKView.h:173.
-            if let track = try? await asset.loadTracks(withMediaType: .video).first,
-               let fps = try? await track.load(.nominalFrameRate), fps > 0 {
+            // Pull display orientation + frame rate + PAR off the first video track.
+            // preferredTransform rotates the encoded frame for display (portrait phone
+            // clips are typically encoded landscape with a 90° transform). PAR comes
+            // from the format description and stretches non-square encoded pixels
+            // (DVD, some broadcast).
+            if let track = try? await asset.loadTracks(withMediaType: .video).first {
+                let naturalSize = (try? await track.load(.naturalSize)) ?? .zero
+                let preferredTransform = (try? await track.load(.preferredTransform)) ?? .identity
+                let fps = (try? await track.load(.nominalFrameRate)) ?? 0
+                let descriptions: [CMFormatDescription] = (try? await track.load(.formatDescriptions)) ?? []
+
+                // Decompose preferredTransform to a 90°-quantized rotation. atan2(b, a)
+                // is the rotation angle in CG's row-vector convention. Round to nearest
+                // 90° (the actual content of preferredTransform is almost always exact).
+                let angleDeg = atan2(preferredTransform.b, preferredTransform.a) * 180.0 / .pi
+                let normalizedDeg = (angleDeg + 360.0).truncatingRemainder(dividingBy: 360.0)
+                let quadrant = Int((normalizedDeg / 90.0).rounded()) % 4
+                let rotMatrix: simd_float2x2
+                switch quadrant {
+                case 1: rotMatrix = simd_float2x2(columns: (SIMD2<Float>(0, -1), SIMD2<Float>(1, 0)))
+                case 2: rotMatrix = simd_float2x2(columns: (SIMD2<Float>(-1, 0), SIMD2<Float>(0, -1)))
+                case 3: rotMatrix = simd_float2x2(columns: (SIMD2<Float>(0, 1), SIMD2<Float>(-1, 0)))
+                default: rotMatrix = matrix_identity_float2x2
+                }
+
+                // Pixel aspect ratio (PAR) — typically 1:1 for digital files. When
+                // present, multiplies encoded width to get display width.
+                var par: (CGFloat, CGFloat) = (1, 1)
+                if let desc = descriptions.first,
+                   let parDict = CMFormatDescriptionGetExtension(
+                        desc,
+                        extensionKey: kCMFormatDescriptionExtension_PixelAspectRatio
+                   ) as? [String: Any],
+                   let h = parDict[kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing as String] as? Double,
+                   let v = parDict[kCMFormatDescriptionKey_PixelAspectRatioVerticalSpacing as String] as? Double,
+                   v > 0 {
+                    par = (CGFloat(h), CGFloat(v))
+                }
+
+                let preRotAspect = (naturalSize.height > 0)
+                    ? (naturalSize.width * par.0 / par.1) / naturalSize.height
+                    : 1.0
+                let aspect = (quadrant % 2 == 0) ? preRotAspect : 1.0 / preRotAspect
+
                 let rounded = max(1, Int(fps.rounded()))
-                await MainActor.run { self.view?.preferredFramesPerSecond = rounded }
+                await MainActor.run {
+                    self.rotationQuadrant = quadrant
+                    self.rotation = rotMatrix
+                    self.displayAspect = aspect
+                    if fps > 0 {
+                        self.contentFPS = rounded
+                        if let v = self.view { self.ensureDisplayLink(view: v, preferredFPS: rounded) }
+                    }
+                    // Force re-derivation of intake uniforms (which now include rotation).
+                    self.lastPixelFormat = 0
+                    // Force linearTexture realloc if rotation changes its dimensions.
+                    self.linearTexture = nil
+                }
             }
             if let group = try? await asset.loadMediaSelectionGroup(for: .legible) {
                 await MainActor.run {
@@ -837,16 +1056,23 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
         kernelLUT = lutTex
         argumentTable.setTexture(kernelLUT.gpuResourceID, index: 1)
 
-        uniformsBuffer = device.makeBuffer(length: 16, options: .storageModeShared)
-        // Intake uniforms: 3×3 matrix (laid out as 3× float4 columns to satisfy
-        // Metal's std140-like packing of float3x3) + y scale/bias + cbcr scale/bias
-        // + tf flag + chroma siting offset. Size with padding: 80 bytes; round up.
-        intakeUniformsBuffer = device.makeBuffer(length: 96, options: .storageModeShared)
-        allocator = device.makeCommandAllocator()
-        scalerFence = device.makeFence()
-        intakeFence = device.makeFence()
-        commandBuffer = device.makeCommandBuffer()
-        frameEvent = device.makeSharedEvent()
+        // Intake uniforms: float3x3 (48) + 3× float2 (24) + float2x2 (16) + 2× float (8) = 96,
+        // allocated at 112 for headroom. See IntakeUniforms in shader.
+        guard let uBuf = device.makeBuffer(length: 16, options: .storageModeShared),
+              let iBuf = device.makeBuffer(length: 112, options: .storageModeShared),
+              let alloc = device.makeCommandAllocator(),
+              let intakeF = device.makeFence(),
+              let cmd = device.makeCommandBuffer(),
+              let event = device.makeSharedEvent() else {
+            errorMessage = "Failed to allocate Metal resources."
+            return
+        }
+        uniformsBuffer = uBuf
+        intakeUniformsBuffer = iBuf
+        allocator = alloc
+        intakeFence = intakeF
+        commandBuffer = cmd
+        frameEvent = event
         pendingFrameValue = 0
 
         // Pipeline:
@@ -873,13 +1099,14 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
             // bilinear blit uses tf to re-encode on output.
             struct Uniforms { float2 quadScale; float ratio; float tf; };
 
-            // Intake uniforms — std140-ish layout, columns of float3x3 each padded
-            // to float4 stride (48 bytes), then 8/8/8/4/4 = 80 bytes total.
+            // Intake uniforms — columns of float3x3 each padded to float4 stride
+            // (48 bytes), then 8/8/8/16/4/4 = 96 bytes total.
             struct IntakeUniforms {
                 float3x3 yuvToRgb;
                 float2 yScaleBias;     // Y' = sample * yScaleBias.x + yScaleBias.y
                 float2 cScaleBias;     // C' = sample * cScaleBias.x + cScaleBias.y, ∈[-0.5,0.5]
                 float2 chromaOffset;   // siting offset, in chroma-pixel units
+                float2x2 rotation;     // display texCoord → source texCoord, about (0.5, 0.5)
                 float tf;
                 float _pad;
             };
@@ -1007,9 +1234,14 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
                 float chromaW = float(cbcrTex.get_width());
                 float chromaH = float(cbcrTex.get_height());
 
+                // The render target is display-oriented (dimensions swapped for 90°/
+                // 270° sources); rotate the coord about the center to sample the
+                // unrotated source planes.
+                float2 tc = u.rotation * (in.texCoord - 0.5) + 0.5;
+
                 // Luma: sampled at the corresponding integer luma pixel (1:1).
-                float lx = in.texCoord.x * lumaW;
-                float ly = in.texCoord.y * lumaH;
+                float lx = tc.x * lumaW;
+                float ly = tc.y * lumaH;
                 float ySample = yTex.sample(ySampler, float2(lx, ly)).x;
                 float Yn = ySample * u.yScaleBias.x + u.yScaleBias.y;
 
@@ -1153,6 +1385,7 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
                                                                       fragmentName: "fragmentShaderBlitEncode",
                                                                       colorFormat: pixelFormat)
                 self.player?.play()
+                await MainActor.run { self.setPlaybackActivity(true) }
             } catch {
                 await MainActor.run { self.errorMessage = "Pipeline state build failed: \(error.localizedDescription)" }
             }
@@ -1169,57 +1402,86 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
         else { return }
 
         if let output = videoOutput, let item = playerItem {
+            // Predict which item-time will be on screen at the NEXT vsync, so the
+            // frame we pull lines up with the frame we'll actually present.
+            // nextOutputHostTime is the targetTimestamp from the most recent display
+            // link fire (the host time of the upcoming refresh).
+            let hostTime = nextOutputHostTime > 0 ? nextOutputHostTime : CACurrentMediaTime()
+            let time = output.itemTime(forHostTime: hostTime)
             let now = item.currentTime().seconds
             if abs(now - currentTime) >= 0.1 { currentTime = now }
-            let time = item.currentTime()
             // While a seek is in flight, freeze on the last texture instead of pulling
             // the output's transient queue — otherwise forward seeks visibly fast-forward
             // through the buffered frames the player decoded ahead of the old playhead.
+            var displayTime = CMTime.invalid
             if !isSeeking,
                output.hasNewPixelBuffer(forItemTime: time),
-               let pixelBuffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil),
+               let pixelBuffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &displayTime),
                let attachmentsCF = CVBufferCopyAttachments(pixelBuffer, .shouldPropagate) {
 
+                // Drop detection: consecutive pulled frames should be ~1/fps apart.
+                // A gap well beyond that means intermediate frames were never shown.
+                // Negative deltas (loop-around, backwards steps) just re-arm the chain.
+                if displayTime.isNumeric, let fps = contentFPS, fps > 0, (player?.rate ?? 0) > 0 {
+                    let t = displayTime.seconds
+                    let expected = 1.0 / Double(fps)
+                    if lastPulledItemTime >= 0 {
+                        let delta = t - lastPulledItemTime
+                        if delta > expected * 1.75 {
+                            droppedFrames += max(1, Int((delta / expected).rounded()) - 1)
+                        }
+                    }
+                    lastPulledItemTime = t
+                }
+
                 let attachments = attachmentsCF as NSDictionary
-                if !didSetColorSpace,
+                // Re-derive colorspace and intake uniforms whenever the pixel format
+                // changes — most streams are stable but some sources splice between
+                // SDR/HDR or 8/10-bit segments, and both the layer tagging and the
+                // per-format constants (range scale/bias, chroma layout) go stale if
+                // we latch them once per video.
+                let curPixFmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
+                let formatChanged = curPixFmt != lastPixelFormat
+                if !didSetColorSpace || formatChanged,
                    let cs = CVImageBufferCreateColorSpaceFromAttachments(attachmentsCF)?.takeRetainedValue(),
                    let metalLayer = view.layer as? CAMetalLayer {
                     metalLayer.colorspace = cs
-                    let (label, isHDR, tf) = Self.classify(colorspace: cs)
-                    metalLayer.wantsExtendedDynamicRangeContent = isHDR
+                    let (label, hdr, tf) = Self.classify(colorspace: cs)
+                    metalLayer.wantsExtendedDynamicRangeContent = hdr
                     colorspaceLabel = label
+                    isHDR = hdr
                     // After the intake pass everything is linear-light, so the
                     // perceptual / sRGB-encoded scaler mode no longer applies.
                     // For HDR we stay in `.hdr` because PQ-decoded peaks reach
                     // [0, 1] = [0, 10000 nits] — the "reversible tone map" is
                     // identity in our case. For SDR we use `.linear` since the
                     // intake pass already removed the sRGB curve. MTLFXSpatialScaler.h:19-28.
-                    scalerColorMode = isHDR ? .hdr : .linear
+                    scalerColorMode = hdr ? .hdr : .linear
                     transferFunction = tf
-                    // Deliberately leave `edrMetadata = nil`. Per CAMetalLayer.h:131,
-                    // a nil metadata means "render without tone mapping; values above
-                    // the maximum EDR value may be clamped." For reference playback
-                    // we want exactly that — the pixels go to the panel as authored,
-                    // and what the panel can't reproduce clips at peak. No creative
-                    // OS-side re-mapping.
-                    metalLayer.edrMetadata = nil
+                    // For PQ and SDR we leave edrMetadata nil — per CAMetalLayer.h:131
+                    // that means "render without tone mapping; clip above max EDR."
+                    // For HLG we attach CAEDRMetadata.hlg so the OS applies the
+                    // standard HLG EOTF (which includes the BT.2100 OOTF) to the
+                    // HLG-encoded values we write to the drawable. Without this the
+                    // OS still color-manages the HLG-tagged layer, but attaching
+                    // the metadata makes the system gamma choice explicit.
+                    metalLayer.edrMetadata = (tf == .hlg) ? CAEDRMetadata.hlg : nil
                     didSetColorSpace = true
                     // If the scaler was built under a stale colorProcessingMode, rebuild it.
                     scaler = nil
                 }
 
-                if !didInspectFormat {
+                if formatChanged {
                     writeIntakeUniforms(pixelBuffer: pixelBuffer, attachments: attachments)
-                    didInspectFormat = true
+                    lastPixelFormat = curPixFmt
                 }
 
                 // Bi-planar YUV intake. Plane 0 = Y, plane 1 = CbCr interleaved at
                 // half-resolution. Pixel format dictates Metal format per plane:
                 // 8-bit → r8Unorm / rg8Unorm; 10-bit MSB-aligned → r16Unorm /
                 // rg16Unorm (we compensate for the 6-bit shift in-shader via yScale).
-                let pixFmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
-                let is10bit = (pixFmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
-                               pixFmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
+                let is10bit = (curPixFmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+                               curPixFmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
                 let yFmt: MTLPixelFormat  = is10bit ? .r16Unorm : .r8Unorm
                 let cFmt: MTLPixelFormat  = is10bit ? .rg16Unorm : .rg8Unorm
                 let lumaW = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
@@ -1240,10 +1502,15 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
                 yTexture = yCV.flatMap { CVMetalTextureGetTexture($0) }
                 cbcrTexture = cCV.flatMap { CVMetalTextureGetTexture($0) }
 
-                // Linear-light intermediate, source resolution, rgba16Float. Realloc
-                // when source dimensions change (rare, but possible across seeks).
-                if linearTexture?.width != lumaW || linearTexture?.height != lumaH {
-                    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: lumaW, height: lumaH, mipmapped: false)
+                // Linear-light intermediate at source resolution, display-oriented:
+                // dimensions swap for 90°/270° sources so everything downstream
+                // (EWA, MetalFX, fit/fill) sees an upright image. Realloc when the
+                // dimensions change (track metadata arriving, rare mid-stream shifts).
+                let rotated = rotationQuadrant % 2 == 1
+                let intakeW = rotated ? lumaH : lumaW
+                let intakeH = rotated ? lumaW : lumaH
+                if linearTexture?.width != intakeW || linearTexture?.height != intakeH {
+                    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: intakeW, height: intakeH, mipmapped: false)
                     d.usage = [.renderTarget, .shaderRead]
                     linearTexture = device.makeTexture(descriptor: d)
                     scaler = nil
@@ -1255,7 +1522,11 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
         let inputTexture = linearTexture
 
         let viewportSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
-        let imageAspect = CGFloat(inputTexture.width) / CGFloat(inputTexture.height)
+        // PAR-corrected display aspect once track metadata is in (anamorphic DVD /
+        // broadcast sources); the display-oriented texture's own aspect until then.
+        let imageAspect = displayAspect > 0
+            ? displayAspect
+            : CGFloat(inputTexture.width) / CGFloat(inputTexture.height)
         let viewportAspect = viewportSize.width / viewportSize.height
 
         let targetSize: CGSize
@@ -1276,7 +1547,7 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
             let (outputWidth, outputHeight) = (Int(targetSize.width), Int(targetSize.height))
 
             if outputWidth > inputTexture.width || outputHeight > inputTexture.height,
-               MTLFXSpatialScalerDescriptor.supportsDevice(device) {
+               MTLFXSpatialScalerDescriptor.supportsMetal4FX(device) {
                 let desc = MTLFXSpatialScalerDescriptor()
                 desc.inputWidth = inputTexture.width
                 desc.inputHeight = inputTexture.height
@@ -1287,7 +1558,14 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
                 desc.colorProcessingMode = scalerColorMode
 
                 if let s = desc.makeSpatialScaler(device: device, compiler: compiler) {
-                    s.fence = scalerFence
+                    // The scaler waits on this fence before reading its input and
+                    // signals it after writing its output (MTLFXSpatialScaler.h:169 —
+                    // single fence for untracked resources). It MUST be the same fence
+                    // the intake pass updates, otherwise the scaler races the intake
+                    // write into linearTexture and samples not-yet-rendered tiles —
+                    // black speckle in the not-yet-written region (e.g. bottom of the
+                    // frame). Metal 4 command buffers don't auto-track this hazard.
+                    s.fence = intakeFence
                     let outDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: outputWidth, height: outputHeight, mipmapped: false)
                     outDesc.usage = s.outputTextureUsage
                     if let outTex = device.makeTexture(descriptor: outDesc) {
@@ -1295,13 +1573,6 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
                     }
                 }
             }
-        }
-
-        if let (s, output) = scaler {
-            s.colorTexture = inputTexture
-            s.outputTexture = output
-            s.inputContentWidth = inputTexture.width
-            s.inputContentHeight = inputTexture.height
         }
 
         // EWA filter runs whenever we're sampling the source ourselves (i.e. no
@@ -1333,9 +1604,9 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
             // letting us push — varies live with the brightness slider on XDR
             // displays. Only meaningful when the layer is in HDR mode.
             let edr = view.window?.screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0
-            let isHDR = transferFunction == .pq || transferFunction == .hlg || transferFunction == .linear
             let edrLine = isHDR ? String(format: "\nPanel peak: %.0f nits", edr * 100) : ""
-            let newInfo = "Input: \(inputTexture.width)x\(inputTexture.height)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)\nColorspace: \(colorspaceLabel)\(edrLine)"
+            let statsLine = String(format: "\nFPS: %.1f · Dropped: %d", measuredFPS, droppedFrames)
+            let newInfo = "Input: \(inputTexture.width)x\(inputTexture.height)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)\nColorspace: \(colorspaceLabel)\(edrLine)\(statsLine)"
             if newInfo != info { info = newInfo }
         }
 
@@ -1430,8 +1701,11 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
             argumentTable.setAddress(uniformsBuffer.gpuAddress, index: 0)
 
             guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, options: MTL4RenderEncoderOptions()) else { return }
+            // Waiting on intakeFence covers both paths: the intake pass updates it,
+            // and (when a scaler ran) the MetalFX scaler re-updates it after writing
+            // its output — so this one wait orders the blit after whichever produced
+            // the texture we sample below.
             encoder.waitForFence(intakeFence, beforeEncoderStages: .fragment)
-            if scaleMode != .off && scaler != nil { encoder.waitForFence(scalerFence, beforeEncoderStages: .fragment) }
             encoder.setRenderPipelineState(renderPipelineBilinear!)
             encoder.setArgumentTable(argumentTable, stages: [.vertex, .fragment])
             encoder.drawPrimitives(primitiveType: .triangle, vertexStart: 0, vertexCount: 6)
@@ -1444,7 +1718,23 @@ class Renderer: NSObject, MTKViewDelegate, ObservableObject, AVPlayerItemLegible
         pendingFrameValue += 1
         queue.signalEvent(frameEvent, value: pendingFrameValue)
         queue.signalDrawable(drawable)
-        drawable.present()
+        // Schedule presentation for the predicted vsync. Falls back to ASAP if we
+        // haven't received a display-link tick yet (first frame).
+        if nextOutputHostTime > 0 {
+            drawable.present(at: nextOutputHostTime)
+        } else {
+            drawable.present()
+        }
+
+        // Presented-frame rate over a ~0.5s sliding window.
+        let now = CACurrentMediaTime()
+        if fpsWindowStart == 0 { fpsWindowStart = now }
+        fpsFrameCount += 1
+        if now - fpsWindowStart >= 0.5 {
+            measuredFPS = Double(fpsFrameCount) / (now - fpsWindowStart)
+            fpsFrameCount = 0
+            fpsWindowStart = now
+        }
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
