@@ -8,10 +8,16 @@ rm -rf MetalFrame.app
 mkdir -p MetalFrame.app/Contents/MacOS
 
 # Compile the Swift code + link (optimized — swiftc defaults to -Onone)
-swiftc metalframe.swift -O \
+swiftc metalframe.swift \
+    MKVDemuxer.swift \
+    VideoDecodePipeline.swift \
+    AudioPipeline.swift \
+    PlaybackEngine.swift \
+    -O \
     -o MetalFrame.app/Contents/MacOS/MetalFrame \
     -framework SwiftUI -framework Metal -framework MetalKit \
     -framework MetalFX -framework AVFoundation -framework CoreVideo \
+    -framework VideoToolbox -framework AudioToolbox -lcompression \
     -parse-as-library
 
 # Create Info.plist

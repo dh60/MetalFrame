@@ -62,11 +62,6 @@ struct MetalView: View {
                     .padding(.bottom, 10)
                 }
             }
-            if renderer.isRemuxing {
-                RemuxingIndicator()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .transition(.blurReplace)
-            }
             if showStatusOverlay {
                 Text(renderer.statusLabel)
                     .font(.system(size: 14, weight: .medium, design: .rounded))
@@ -188,6 +183,17 @@ struct MetalView: View {
             flashStatusOverlay()
             return .handled
         }
+        .onKeyPress("a") {
+            renderer.cycleAudio()
+            flashStatusOverlay()
+            return .handled
+        }
+        // Engine-initiated status messages (audio fallback notes, track
+        // switches it performs on its own) flash the same overlay the
+        // keyboard shortcuts use.
+        .onChange(of: renderer.statusLabel) {
+            if !renderer.statusLabel.isEmpty { flashStatusOverlay() }
+        }
         .onKeyPress("f") { NSApplication.shared.keyWindow?.toggleFullScreen(nil); return .handled }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
             // Native fullscreen already hides the menu bar / Dock via auto-hide, which
@@ -261,38 +267,6 @@ struct ProgressBar: View {
                     }
             )
         }
-    }
-}
-
-struct RemuxingIndicator: View {
-    @State private var breathe = false
-
-    var body: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 4) {
-                ForEach(0..<3, id: \.self) { i in
-                    Circle()
-                        .fill(.white.opacity(0.9))
-                        .frame(width: 6, height: 6)
-                        .offset(y: breathe ? -4 : 4)
-                        .animation(
-                            .easeInOut(duration: 0.5)
-                                .repeatForever(autoreverses: true)
-                                .delay(Double(i) * 0.15),
-                            value: breathe
-                        )
-                }
-            }
-            Text("Remuxing")
-                .font(.title3.weight(.medium))
-                .foregroundStyle(.white)
-        }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 14)
-        .glassEffect(in: .capsule)
-        .scaleEffect(breathe ? 1.04 : 0.98)
-        .animation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true), value: breathe)
-        .onAppear { breathe = true }
     }
 }
 
@@ -386,7 +360,9 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     var cbcrSource: CVMetalTexture?
     weak var view: MTKView?
     var activity: NSObjectProtocol?
-    var remuxedUrl: URL?
+    // Native playback engine — owns demux/decode for MKV. When non-nil it is
+    // the frame producer; otherwise the AVPlayer path (MP4/MOV) is.
+    var engine: PlaybackEngine?
     var currentSetupTask: Task<Void, Never>?
     var pendingSeekTime: Double?
     var isSeeking = false
@@ -400,7 +376,6 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     var currentTime: Double = 0
     var duration: Double = 0
     var colorspaceLabel = "sRGB"
-    var isRemuxing = false
     var subtitleText = ""
     var statusLabel = ""
     var selectedSubtitleIndex = -1
@@ -451,7 +426,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
 
     deinit {
         currentSetupTask?.cancel()
-        cleanupRemux()
+        engine?.shutdown()
         displayLink?.invalidate()
         if let screenObservation { NotificationCenter.default.removeObserver(screenObservation) }
         if let endObservation { NotificationCenter.default.removeObserver(endObservation) }
@@ -509,11 +484,6 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     @objc func displayLinkFired(_ link: CADisplayLink) {
         nextOutputHostTime = link.targetTimestamp
         view?.draw()
-    }
-
-    func cleanupRemux() {
-        if let url = remuxedUrl { try? FileManager.default.removeItem(at: url) }
-        remuxedUrl = nil
     }
 
     // YUV→RGB matrix for a given (Kr, Kb) pair, expecting Y ∈ [0,1] and Cb/Cr ∈ [-0.5,0.5].
@@ -636,6 +606,24 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     }
 
     func cycleSubtitles() {
+        if let engine {
+            let tracks = engine.subtitleTracks
+            guard !tracks.isEmpty else {
+                statusLabel = "Subtitles: None Available"
+                return
+            }
+            selectedSubtitleIndex += 1
+            if selectedSubtitleIndex >= tracks.count {
+                selectedSubtitleIndex = -1
+                subtitleText = ""
+                statusLabel = "Subtitles: Off"
+            } else {
+                let t = tracks[selectedSubtitleIndex]
+                let label = t.name ?? t.language
+                statusLabel = "Subtitles \(selectedSubtitleIndex + 1)/\(tracks.count): \(label)"
+            }
+            return
+        }
         guard let group = subtitleGroup, !subtitleOptions.isEmpty else {
             statusLabel = "Subtitles: None Available"
             return
@@ -654,11 +642,30 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         }
     }
 
+    func cycleAudio() {
+        guard let engine else {
+            statusLabel = "Audio: track switching is MKV-only for now"
+            return
+        }
+        statusLabel = engine.cycleAudioTrack()
+    }
+
     func seek(to time: Double) {
         let clamped = max(0, min(duration, time))
         pendingSeekTime = clamped
         isSeeking = true
         lastPulledItemTime = -1
+        if let engine {
+            engine.seek(toSeconds: clamped) { [weak self] in
+                guard let self else { return }
+                if self.pendingSeekTime == clamped {
+                    self.pendingSeekTime = nil
+                    self.isSeeking = false
+                    self.currentTime = clamped
+                }
+            }
+            return
+        }
         let target = CMTime(seconds: clamped, preferredTimescale: 600)
         player?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             guard let self else { return }
@@ -670,11 +677,18 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     }
 
     func seek(by seconds: Double) {
-        let current = pendingSeekTime ?? player?.currentTime().seconds ?? 0
+        let current = pendingSeekTime
+            ?? engine.map { $0.currentTimeSeconds() }
+            ?? player?.currentTime().seconds
+            ?? 0
         seek(to: current + seconds)
     }
 
     func togglePlayback() {
+        if let engine {
+            setPlaybackActivity(engine.togglePlayPause())
+            return
+        }
         guard let player else { return }
         if player.rate == 0 {
             player.play()
@@ -685,188 +699,97 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         }
     }
 
+    @MainActor
     func setupVideo(url: URL, view: MTKView) {
         currentSetupTask?.cancel()
+        currentSetupTask = nil
         errorMessage = nil
-        cleanupRemux()
-        currentSetupTask = Task { [weak self] in
-            guard let self else { return }
-            let playUrl = await self.remuxIfNeeded(url: url)
-            if Task.isCancelled { return }
-            await MainActor.run {
-                self.setupVideoPipeline(url: playUrl, view: view)
-            }
+        engine?.shutdown()
+        engine = nil
+        player?.pause()
+        player = nil
+        let ext = url.pathExtension.lowercased()
+        if ext == "mkv" || ext == "webm" {
+            setupEnginePipeline(url: url, view: view)
+        } else {
+            setupVideoPipeline(url: url, view: view)
         }
     }
 
-    // ffmpeg subprocesses do not inherit the parent's security-scoped resource grant.
-    // This works today because the app is unsandboxed (build.sh codesigns ad-hoc with no
-    // entitlements). If you sandbox the app, file-picker URLs will need a different path
-    // here (e.g., copy via NSFileCoordinator before invoking ffmpeg).
-    func remuxIfNeeded(url: URL) async -> URL {
-        guard url.pathExtension.lowercased() == "mkv" else { return url }
-
-        let access = url.startAccessingSecurityScopedResource()
-        defer { if access { url.stopAccessingSecurityScopedResource() } }
-
-        await MainActor.run { self.isRemuxing = true }
-
-        let fileManager = FileManager.default
-        let tempDir = fileManager.temporaryDirectory
-        let outputName = UUID().uuidString + ".mp4"
-        let outputUrl = tempDir.appendingPathComponent(outputName)
-
-        let ffmpegPaths = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
-        let ffmpegPath = ffmpegPaths.first { fileManager.fileExists(atPath: $0) } ?? "/opt/homebrew/bin/ffmpeg"
-        let ffprobePath = ffmpegPath.replacingOccurrences(of: "ffmpeg", with: "ffprobe")
-
-        guard fileManager.fileExists(atPath: ffmpegPath) else {
-            await MainActor.run {
-                self.errorMessage = "ffmpeg not found. Install via Homebrew: brew install ffmpeg"
-                self.isRemuxing = false
-            }
-            return url
-        }
-
-        // Probe per-stream codecs and pick out which subtitle streams are text-based
-        // (mov_text can only carry text subs; PGS/VobSub would abort the whole remux).
-        var isHEVC = false
-        var canCopyAudio = false
-        var textSubtitleStreamIndices: [Int] = []
-        let mp4AudioCodecs: Set = ["aac", "ac3", "eac3", "alac", "mp3"]
-        let textSubtitleCodecs: Set = ["srt", "subrip", "ass", "ssa", "mov_text", "webvtt", "text"]
-        if fileManager.fileExists(atPath: ffprobePath) {
-            let probeProcess = Process()
-            probeProcess.executableURL = URL(fileURLWithPath: ffprobePath)
-            probeProcess.arguments = ["-v", "error", "-show_entries", "stream=codec_name,codec_type", "-of", "csv=p=0", url.path]
-            let probePipe = Pipe()
-            probeProcess.standardOutput = probePipe
-            try? probeProcess.run()
-            probeProcess.waitUntilExit()
-            let probeData = probePipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: probeData, encoding: .utf8) {
-                var subtitleIndex = 0
-                for line in output.split(separator: "\n") {
-                    let parts = line.split(separator: ",")
-                    guard parts.count >= 2 else { continue }
-                    let codec = String(parts[0])
-                    let type = String(parts[1])
-                    switch type {
-                    case "video":
-                        if codec == "hevc" { isHEVC = true }
-                    case "audio":
-                        if mp4AudioCodecs.contains(codec) { canCopyAudio = true }
-                    case "subtitle":
-                        if textSubtitleCodecs.contains(codec) { textSubtitleStreamIndices.append(subtitleIndex) }
-                        subtitleIndex += 1
-                    default:
-                        break
-                    }
-                }
-            }
-        }
-
-        let logUrl = tempDir.appendingPathComponent(UUID().uuidString + ".log")
-        fileManager.createFile(atPath: logUrl.path, contents: nil, attributes: nil)
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: ffmpegPath)
-
-        // 0:V (capital) selects real video streams only — attached cover art
-        // (mjpeg attached_pic) would otherwise be muxed as a video track and can
-        // abort the MP4 muxer.
-        var args = ["-i", url.path, "-map", "0:V?", "-map", "0:a?"]
-        for i in textSubtitleStreamIndices { args += ["-map", "0:s:\(i)"] }
-        args += ["-c:v", "copy", "-c:a", canCopyAudio ? "copy" : "alac"]
-        if !textSubtitleStreamIndices.isEmpty { args += ["-c:s", "mov_text"] }
-        if isHEVC { args += ["-tag:v", "hvc1"] }
-        // TrueHD/Atmos (and a few other codecs) are flagged "experimental" by the MP4
-        // muxer, so a straight -c copy aborts header write with ffmpeg exit code 88.
-        // Lower the muxer's strictness so those streams can be carried unchanged.
-        args += ["-strict", "experimental"]
-        args += ["-ignore_unknown", "-copyts", outputUrl.path, "-y"]
-        process.arguments = args
-
-        let logHandle = try? FileHandle(forWritingTo: logUrl)
-        process.standardOutput = logHandle
-        process.standardError = logHandle
-
-        func cleanupTempFiles() {
-            try? fileManager.removeItem(at: logUrl)
-            try? fileManager.removeItem(at: outputUrl)
-        }
-
-        // Don't block the cooperative pool thread with waitUntilExit — pipe through
-        // terminationHandler so the Task suspends while ffmpeg works (which can take
-        // many seconds for large MKVs) and resumes when it exits.
-        do {
-            try process.run()
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                process.terminationHandler = { _ in continuation.resume() }
-            }
-            try? logHandle?.close()
-        } catch {
-            cleanupTempFiles()
-            await MainActor.run {
-                self.errorMessage = "ffmpeg launch failed: \(error.localizedDescription)"
-                self.isRemuxing = false
-            }
-            return url
-        }
-
-        if process.terminationStatus != 0 {
-            let logData = try? Data(contentsOf: logUrl)
-            let logOutput = logData.flatMap { String(data: $0, encoding: .utf8) } ?? "No log output"
-            print("FFmpeg Remux Failed (status \(process.terminationStatus)):\n\(logOutput)")
-            cleanupTempFiles()
-            await MainActor.run {
-                self.errorMessage = "Remux failed (ffmpeg exit \(process.terminationStatus))."
-                self.isRemuxing = false
-            }
-            return url
-        }
-
-        try? fileManager.removeItem(at: logUrl)
-        await MainActor.run { self.isRemuxing = false; self.remuxedUrl = outputUrl }
-        return outputUrl
-    }
-
+    // MKV/WebM go through the native engine: our own Matroska demuxer feeding
+    // VideoToolbox and AVSampleBufferAudioRenderer. The AVPlayer path below
+    // remains for MP4/MOV until Phase 4 unifies the two.
     @MainActor
-    func setupVideoPipeline(url: URL, view: MTKView) {
-        device = view.device
-        queue = device.makeMTL4CommandQueue()
-
+    func setupEnginePipeline(url: URL, view: MTKView) {
+        setPlaybackActivity(false)
+        let newEngine: PlaybackEngine
         do {
-            compiler = try device.makeCompiler(descriptor: MTL4CompilerDescriptor())
+            newEngine = try PlaybackEngine(url: url)
         } catch {
-            errorMessage = "Metal compiler init failed: \(error.localizedDescription)"
+            errorMessage = "Cannot play this file: \(error)"
+            return
+        }
+        engine = newEngine
+        setupMetalCore(view: view)
+        guard errorMessage == nil else {
+            engine = nil
             return
         }
 
-        if let oldCache = textureCache { CVMetalTextureCacheFlush(oldCache, 0) }
-        textureCache = nil
-        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache)
-        guard textureCache != nil else {
-            errorMessage = "Couldn't create texture cache."
-            return
-        }
+        selectedSubtitleIndex = -1
+        subtitleText = ""
+        subtitleOptions = []
+        subtitleGroup = nil
+        currentTime = 0
+        pendingSeekTime = nil
+        measuredFPS = 0
+        fpsFrameCount = 0
+        fpsWindowStart = 0
+        droppedFrames = 0
+        lastPulledItemTime = -1
 
-        scaler = nil
-        didSetColorSpace = false
-        lastPixelFormat = 0
+        duration = newEngine.durationSeconds
+        displayAspect = CGFloat(newEngine.displayAspect ?? 0)
         rotationQuadrant = 0
         rotation = matrix_identity_float2x2
-        displayAspect = 0
-        yTexture = nil
-        cbcrTexture = nil
-        linearTexture = nil
-        ySource = nil
-        cbcrSource = nil
+        if let fps = newEngine.contentFPS, fps > 0 {
+            let rounded = max(1, Int(fps.rounded()))
+            contentFPS = rounded
+            ensureDisplayLink(view: view, preferredFPS: rounded)
+        }
 
-        // Spin up the display link now (before the async track-fps fetch completes)
-        // so we start ticking and can render the first frames as soon as the player
-        // is ready. Frame-rate range gets refined once we know the source fps.
-        ensureDisplayLink(view: view, preferredFPS: nil)
+        newEngine.onStatus = { [weak self] message in
+            self?.statusLabel = message
+        }
+        // At end of playback, rewind and pause so Space replays from the start
+        // (mirrors the AVPlayer end-of-item behavior). Uses the same
+        // isSeeking freeze as user seeks so draw() doesn't pull the new run's
+        // first frames against the stale end-of-file timebase.
+        newEngine.onEnded = { [weak self] in
+            guard let self else { return }
+            self.engine?.setPlaying(false)
+            self.setPlaybackActivity(false)
+            self.isSeeking = true
+            self.pendingSeekTime = 0
+            self.lastPulledItemTime = -1
+            self.engine?.seek(toSeconds: 0) { [weak self] in
+                guard let self else { return }
+                if self.pendingSeekTime == 0 {
+                    self.pendingSeekTime = nil
+                    self.isSeeking = false
+                }
+                self.currentTime = 0
+            }
+        }
+    }
+
+
+    // MP4/MOV playback via AVPlayer (unchanged legacy path — Phase 4 moves
+    // this onto the engine through an AVAssetReader-backed demuxer).
+    @MainActor
+    func setupVideoPipeline(url: URL, view: MTKView) {
+        setupMetalCore(view: view)
+        guard errorMessage == nil else { return }
 
         let asset = AVURLAsset(url: url)
         playerItem = AVPlayerItem(asset: asset)
@@ -1008,6 +931,60 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 }
             }
         }
+    }
+
+    // Kicks off playback once the render pipelines exist — whichever producer
+    // the current file uses.
+    @MainActor
+    func startProducers() {
+        if let engine {
+            engine.start(playing: true)
+            setPlaybackActivity(true)
+        } else if let player {
+            player.play()
+            setPlaybackActivity(true)
+        }
+    }
+
+    // Producer-agnostic Metal setup: device objects, texture cache, kernel
+    // LUT, argument table, uniforms, and the async shader compile. Shared by
+    // the engine (MKV) and AVPlayer (MP4) paths.
+    @MainActor
+    func setupMetalCore(view: MTKView) {
+        device = view.device
+        queue = device.makeMTL4CommandQueue()
+
+        do {
+            compiler = try device.makeCompiler(descriptor: MTL4CompilerDescriptor())
+        } catch {
+            errorMessage = "Metal compiler init failed: \(error.localizedDescription)"
+            return
+        }
+
+        if let oldCache = textureCache { CVMetalTextureCacheFlush(oldCache, 0) }
+        textureCache = nil
+        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache)
+        guard textureCache != nil else {
+            errorMessage = "Couldn't create texture cache."
+            return
+        }
+
+        scaler = nil
+        didSetColorSpace = false
+        lastPixelFormat = 0
+        rotationQuadrant = 0
+        rotation = matrix_identity_float2x2
+        displayAspect = 0
+        yTexture = nil
+        cbcrTexture = nil
+        linearTexture = nil
+        ySource = nil
+        cbcrSource = nil
+
+        // Spin up the display link now (before the async track-fps fetch completes)
+        // so we start ticking and can render the first frames as soon as the player
+        // is ready. Frame-rate range gets refined once we know the source fps.
+        ensureDisplayLink(view: view, preferredFPS: nil)
 
         do {
             let tableDesc = MTL4ArgumentTableDescriptor()
@@ -1384,8 +1361,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 self.renderPipelineBilinear = try await makePipeline(vertexName: "vertexShader",
                                                                       fragmentName: "fragmentShaderBlitEncode",
                                                                       colorFormat: pixelFormat)
-                self.player?.play()
-                await MainActor.run { self.setPlaybackActivity(true) }
+                await MainActor.run { self.startProducers() }
             } catch {
                 await MainActor.run { self.errorMessage = "Pipeline state build failed: \(error.localizedDescription)" }
             }
@@ -1401,29 +1377,51 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
               let frameEvent
         else { return }
 
-        if let output = videoOutput, let item = playerItem {
-            // Predict which item-time will be on screen at the NEXT vsync, so the
-            // frame we pull lines up with the frame we'll actually present.
-            // nextOutputHostTime is the targetTimestamp from the most recent display
-            // link fire (the host time of the upcoming refresh).
-            let hostTime = nextOutputHostTime > 0 ? nextOutputHostTime : CACurrentMediaTime()
+        // Predict which media-time will be on screen at the NEXT vsync, so the
+        // frame we pull lines up with the frame we'll actually present.
+        // nextOutputHostTime is the targetTimestamp from the most recent display
+        // link fire (the host time of the upcoming refresh). While a seek is in
+        // flight, freeze on the last texture instead of pulling — otherwise
+        // forward seeks visibly fast-forward through buffered frames.
+        let hostTime = nextOutputHostTime > 0 ? nextOutputHostTime : CACurrentMediaTime()
+        var pulledBuffer: CVPixelBuffer?
+        var pulledPts: Double = .nan
+
+        if let engine {
+            let mediaNs = engine.mediaTimeNs(forHostSeconds: hostTime)
+            let now = engine.currentTimeSeconds()
+            if abs(now - currentTime) >= 0.1 { currentTime = now }
+            if !isSeeking, let frame = engine.pullFrame(atMediaTimeNs: mediaNs) {
+                pulledBuffer = frame.buffer
+                pulledPts = Double(frame.ptsNs) / 1e9
+            }
+            // Subtitles come from the engine's cue store, keyed by media time.
+            if selectedSubtitleIndex >= 0 {
+                let text = engine.subtitleText(atMediaTimeNs: mediaNs, trackIndex: selectedSubtitleIndex)
+                if text != subtitleText { subtitleText = text }
+            }
+        } else if let output = videoOutput, let item = playerItem {
             let time = output.itemTime(forHostTime: hostTime)
             let now = item.currentTime().seconds
             if abs(now - currentTime) >= 0.1 { currentTime = now }
-            // While a seek is in flight, freeze on the last texture instead of pulling
-            // the output's transient queue — otherwise forward seeks visibly fast-forward
-            // through the buffered frames the player decoded ahead of the old playhead.
             var displayTime = CMTime.invalid
             if !isSeeking,
                output.hasNewPixelBuffer(forItemTime: time),
-               let pixelBuffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &displayTime),
-               let attachmentsCF = CVBufferCopyAttachments(pixelBuffer, .shouldPropagate) {
+               let pixelBuffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &displayTime) {
+                pulledBuffer = pixelBuffer
+                if displayTime.isNumeric { pulledPts = displayTime.seconds }
+            }
+        }
+
+        if let pixelBuffer = pulledBuffer,
+           let attachmentsCF = CVBufferCopyAttachments(pixelBuffer, .shouldPropagate) {
 
                 // Drop detection: consecutive pulled frames should be ~1/fps apart.
                 // A gap well beyond that means intermediate frames were never shown.
                 // Negative deltas (loop-around, backwards steps) just re-arm the chain.
-                if displayTime.isNumeric, let fps = contentFPS, fps > 0, (player?.rate ?? 0) > 0 {
-                    let t = displayTime.seconds
+                let producing = engine?.isPlaying ?? ((player?.rate ?? 0) > 0)
+                if pulledPts.isFinite, let fps = contentFPS, fps > 0, producing {
+                    let t = pulledPts
                     let expected = 1.0 / Double(fps)
                     if lastPulledItemTime >= 0 {
                         let delta = t - lastPulledItemTime
@@ -1515,7 +1513,6 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                     linearTexture = device.makeTexture(descriptor: d)
                     scaler = nil
                 }
-            }
         }
 
         guard let yTexture, let cbcrTexture, let linearTexture else { return }
@@ -1606,7 +1603,8 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             let edr = view.window?.screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0
             let edrLine = isHDR ? String(format: "\nPanel peak: %.0f nits", edr * 100) : ""
             let statsLine = String(format: "\nFPS: %.1f · Dropped: %d", measuredFPS, droppedFrames)
-            let newInfo = "Input: \(inputTexture.width)x\(inputTexture.height)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)\nColorspace: \(colorspaceLabel)\(edrLine)\(statsLine)"
+            let engineLine = engine.map { "\nEngine: native MKV · \($0.usingHardwareDecode ? "hardware" : "software") decode" } ?? ""
+            let newInfo = "Input: \(inputTexture.width)x\(inputTexture.height)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)\nColorspace: \(colorspaceLabel)\(edrLine)\(statsLine)\(engineLine)"
             if newInfo != info { info = newInfo }
         }
 
