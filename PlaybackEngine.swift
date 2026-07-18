@@ -226,7 +226,7 @@ final class PlaybackEngine {
         guard index >= 0, index < audioTracks.count else { return "Audio: None" }
         let t = audioTracks[index]
         var label = "Audio: \(t.language) \(audioCodecLabel(t.codecID)) \(t.channels)ch"
-        if !isPassthroughAudioCodec(t.codecID) {
+        if !isDecodableAudioCodec(t.codecID) {
             label += " — not decodable yet (silent)"
         }
         if audioTracks.count > 1 {
@@ -291,8 +291,8 @@ final class PlaybackEngine {
         let preferredIndex = audioTracks.firstIndex(where: { $0.flagDefault }) ?? 0
         var chosen = preferredIndex
         var note: String?
-        if !isPassthroughAudioCodec(audioTracks[preferredIndex].codecID) {
-            if let fallback = audioTracks.firstIndex(where: { isPassthroughAudioCodec($0.codecID) }) {
+        if !isDecodableAudioCodec(audioTracks[preferredIndex].codecID) {
+            if let fallback = audioTracks.firstIndex(where: { isDecodableAudioCodec($0.codecID) }) {
                 chosen = fallback
                 let skipped = audioCodecLabel(audioTracks[preferredIndex].codecID)
                 note = "Audio: \(skipped) not decodable yet — using \(audioTrackLabel(index: fallback).dropFirst("Audio: ".count))"
@@ -307,7 +307,7 @@ final class PlaybackEngine {
 
     private func applyAudioSelection(index: Int) {
         let track = (index >= 0 && index < audioTracks.count) ? audioTracks[index] : nil
-        if let track, isPassthroughAudioCodec(track.codecID), (try? audioPipeline.configure(track: track)) != nil {
+        if let track, isDecodableAudioCodec(track.codecID), (try? audioPipeline.configure(track: track)) != nil {
             stateLock.withLock {
                 selectedAudioIndexValue = index
                 selectedAudioTrackNumber = track.number
@@ -332,7 +332,7 @@ final class PlaybackEngine {
         if let index = reconfigureAudio {
             applyAudioSelection(index: index)
             if index >= 0, index < audioTracks.count,
-               !isPassthroughAudioCodec(audioTracks[index].codecID) {
+               !isDecodableAudioCodec(audioTracks[index].codecID) {
                 let label = audioTrackLabel(index: index)
                 DispatchQueue.main.async { self.onStatus?(label) }
             }

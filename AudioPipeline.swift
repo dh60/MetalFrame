@@ -22,6 +22,12 @@ func isPassthroughAudioCodec(_ codecID: String) -> Bool {
     }
 }
 
+// Everything we can play: OS-decoded passthrough plus our own decoders.
+// DTS (incl. the core of DTS-HD) decodes via DTSDecoder into PCM.
+func isDecodableAudioCodec(_ codecID: String) -> Bool {
+    isPassthroughAudioCodec(codecID) || codecID == "A_DTS"
+}
+
 // Human label for the status overlay, including codecs we know but can't
 // decode yet (phase-gated own decoders).
 func audioCodecLabel(_ codecID: String) -> String {
@@ -204,6 +210,10 @@ final class AudioPipeline {
 
     private var format: CMAudioFormatDescription?
     private var track: MKVTrack?
+    // DTS: our own decoder feeds PCM buffers; the format description is built
+    // from the first decoded frame (rate/layout come from the bitstream).
+    private var dtsDecoder: DTSDecoder?
+    private var dtsFormatKey: UInt64 = 0
     // Trim bookkeeping: the first buffer after a configure/flush gets
     // TrimDurationAtStart for codec delay (Opus pre-skip) and seek alignment.
     private var pendingStartTrimNs: Int64 = 0
@@ -229,10 +239,13 @@ final class AudioPipeline {
 
     // Select the track this pipeline feeds.
     func configure(track: MKVTrack) throws {
-        let format = try makeAudioFormatDescription(track: track)
+        let isDTS = track.codecID == "A_DTS"
+        let format = isDTS ? nil : try makeAudioFormatDescription(track: track)
         lock.lock()
         self.track = track
         self.format = format
+        self.dtsDecoder = isDTS ? DTSDecoder() : nil
+        self.dtsFormatKey = 0
         fifo.removeAll()
         eof = false
         firstBufferPending = true
@@ -283,6 +296,7 @@ final class AudioPipeline {
         lock.unlock()
         pumpQueue.sync {}  // drain any in-flight pump before flushing the renderer
         renderer.flush()
+        dtsDecoder?.reset()   // safe: pump drained above, and closed blocks new work
         lock.lock()
         firstBufferPending = false
         lastEnqueuedEndNs = Int64.min
@@ -310,7 +324,13 @@ final class AudioPipeline {
         defer { scheduleRepumpIfNeeded() }
         while renderer.isReadyForMoreMediaData {
             lock.lock()
-            guard !closed, !fifo.isEmpty, let format, let track else {
+            guard !closed, !fifo.isEmpty, let track else {
+                lock.unlock()
+                return
+            }
+            let isDTS = track.codecID == "A_DTS"
+            let lockedFormat = format
+            if !isDTS, lockedFormat == nil {
                 lock.unlock()
                 return
             }
@@ -320,6 +340,12 @@ final class AudioPipeline {
             if firstBufferPending { firstBufferPending = false }
             lock.broadcast()
             lock.unlock()
+
+            if isDTS {
+                enqueueDTS(packet: packet, isFirst: isFirst, startTrimNs: startTrim)
+                continue
+            }
+            guard let format = lockedFormat else { continue }
 
             // One MKV block can hold several Dolby syncframes; CoreAudio wants
             // one per sample. Other codecs are one frame per block already.
@@ -352,6 +378,114 @@ final class AudioPipeline {
                 lastEnqueuedEndNs = max(lastEnqueuedEndNs, ptsNs + (pieceDurNs ?? 0))
                 lock.unlock()
             }
+        }
+    }
+
+    // MARK: DTS decode path (pump queue only)
+
+    private func dtsLayoutTag(_ f: DTSDecodedFrame) -> AudioChannelLayoutTag? {
+        switch (f.channelCount, f.amode, f.hasLFE) {
+        case (1, _, false): return kAudioChannelLayoutTag_Mono
+        case (2, _, false): return kAudioChannelLayoutTag_Stereo
+        case (3, 5, false): return kAudioChannelLayoutTag_MPEG_3_0_A   // L R C
+        case (3, 6, false): return kAudioChannelLayoutTag_ITU_2_1      // L R Cs
+        case (3, _, true):  return kAudioChannelLayoutTag_DVD_4        // L R LFE
+        case (4, 7, false): return kAudioChannelLayoutTag_MPEG_4_0_A   // L R C Cs
+        case (4, 8, false): return kAudioChannelLayoutTag_Quadraphonic // L R Ls Rs
+        case (5, 9, false): return kAudioChannelLayoutTag_MPEG_5_0_A   // L R C Ls Rs
+        case (6, 9, true):  return kAudioChannelLayoutTag_MPEG_5_1_A   // L R C LFE Ls Rs
+        default: return nil
+        }
+    }
+
+    private func makeDTSFormat(frame f: DTSDecodedFrame) throws -> CMAudioFormatDescription {
+        var asbd = AudioStreamBasicDescription()
+        asbd.mSampleRate = Double(f.sampleRate)
+        asbd.mFormatID = kAudioFormatLinearPCM
+        asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
+        asbd.mChannelsPerFrame = UInt32(f.channelCount)
+        asbd.mBitsPerChannel = 32
+        asbd.mBytesPerFrame = UInt32(4 * f.channelCount)
+        asbd.mFramesPerPacket = 1
+        asbd.mBytesPerPacket = asbd.mBytesPerFrame
+        var layout = AudioChannelLayout()
+        if let tag = dtsLayoutTag(f) { layout.mChannelLayoutTag = tag }
+        let hasLayout = layout.mChannelLayoutTag != 0
+        var desc: CMAudioFormatDescription?
+        let status = withUnsafePointer(to: layout) { lp in
+            CMAudioFormatDescriptionCreate(
+                allocator: kCFAllocatorDefault, asbd: &asbd,
+                layoutSize: hasLayout ? MemoryLayout<AudioChannelLayout>.size : 0,
+                layout: hasLayout ? lp : nil,
+                magicCookieSize: 0, magicCookie: nil,
+                extensions: nil, formatDescriptionOut: &desc)
+        }
+        guard status == noErr, let desc else {
+            throw MKVError.io("DTS PCM format description failed (\(status))")
+        }
+        return desc
+    }
+
+    private func makePCMSampleBuffer(pcm: [Float], format: CMAudioFormatDescription,
+                                     frameCount: Int, ptsNs: Int64) throws -> CMSampleBuffer {
+        let byteCount = pcm.count * MemoryLayout<Float>.size
+        var blockBuffer: CMBlockBuffer?
+        var status = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: byteCount,
+            blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
+            offsetToData: 0, dataLength: byteCount, flags: 0, blockBufferOut: &blockBuffer)
+        guard status == kCMBlockBufferNoErr, let blockBuffer else {
+            throw MKVError.io("CMBlockBufferCreate failed (\(status))")
+        }
+        pcm.withUnsafeBytes { buf in
+            _ = CMBlockBufferReplaceDataBytes(with: buf.baseAddress!, blockBuffer: blockBuffer,
+                                              offsetIntoDestination: 0, dataLength: byteCount)
+        }
+        var sb: CMSampleBuffer?
+        status = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+            allocator: kCFAllocatorDefault, dataBuffer: blockBuffer,
+            formatDescription: format, sampleCount: frameCount,
+            presentationTimeStamp: CMTime(value: ptsNs, timescale: 1_000_000_000),
+            packetDescriptions: nil, sampleBufferOut: &sb)
+        guard status == noErr, let sb else {
+            throw MKVError.io("PCM CMSampleBuffer failed (\(status))")
+        }
+        return sb
+    }
+
+    private func enqueueDTS(packet: MKVPacket, isFirst: Bool, startTrimNs: Int64) {
+        guard let decoder = dtsDecoder else { return }
+        let frames = decoder.decode(packet: packet.data)
+        var offsetNs: Int64 = 0
+        for (i, f) in frames.enumerated() {
+            let key = UInt64(f.sampleRate) << 8 | UInt64(f.channelCount)
+            if key != dtsFormatKey {
+                guard let fmt = try? makeDTSFormat(frame: f) else { continue }
+                lock.lock()
+                format = fmt
+                dtsFormatKey = key
+                lock.unlock()
+            }
+            lock.lock()
+            let fmt = format
+            lock.unlock()
+            guard let fmt else { continue }
+            let ptsNs = packet.ptsNs + offsetNs
+            let durNs = Int64(f.samplesPerChannel) * 1_000_000_000 / Int64(f.sampleRate)
+            offsetNs += durNs
+            guard let sb = try? makePCMSampleBuffer(pcm: f.pcm, format: fmt,
+                                                    frameCount: f.samplesPerChannel,
+                                                    ptsNs: ptsNs) else { continue }
+            if isFirst, i == 0, startTrimNs > 0 {
+                let trim = CMTime(value: startTrimNs, timescale: 1_000_000_000)
+                CMSetAttachment(sb, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+                                value: CMTimeCopyAsDictionary(trim, allocator: kCFAllocatorDefault),
+                                attachmentMode: kCMAttachmentMode_ShouldPropagate)
+            }
+            renderer.enqueue(sb)
+            lock.lock()
+            lastEnqueuedEndNs = max(lastEnqueuedEndNs, ptsNs + durNs)
+            lock.unlock()
         }
     }
 
