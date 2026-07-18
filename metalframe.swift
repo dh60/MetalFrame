@@ -371,6 +371,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     var scaleMode: ScaleMode = .fit {
         didSet {
             scaler = nil
+            needsRedraw = true
         }
     }
     var currentTime: Double = 0
@@ -399,6 +400,14 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     var droppedFrames = 0
     var lastPulledItemTime: Double = -1
     var nextOutputHostTime: CFTimeInterval = 0
+    // Interval of the current display link cadence (targetTimestamp − timestamp).
+    // Used to pull the frame NEAREST the upcoming vsync (half-interval lookahead)
+    // instead of newest-at-or-before, which centers the presentation error.
+    var nextOutputPeriod: CFTimeInterval = 0
+    // Forces one render through draw() when the output itself changed while no
+    // new frame is due (resize, scale-mode change, screen move) — draw() skips
+    // all GPU work otherwise whenever the pull comes back empty.
+    var needsRedraw = true
     var screenObservation: NSObjectProtocol?
 
     // Compare CFString names directly against CGColorSpace constants — substring
@@ -449,19 +458,30 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     // screen-specific, so dragging the window to a 60Hz panel from a 120Hz panel
     // must rebuild it to get the new vsync cadence.
     @MainActor
-    func ensureDisplayLink(view: MTKView, preferredFPS: Int? = nil) {
+    func ensureDisplayLink(view: MTKView, preferredFPS: Double? = nil) {
         let screen = view.window?.screen ?? NSScreen.main
         guard let screen else { return }
         displayLink?.invalidate()
         let link = screen.displayLink(target: self, selector: #selector(displayLinkFired(_:)))
-        if let fps = preferredFPS, fps > 0 {
-            // Lock the link to the content rate so VRR/ProMotion panels can drop to
-            // the content frame rate (e.g., 120Hz panel → 24Hz refresh for 24fps film).
-            let f = Float(fps)
+        if let fps = preferredFPS, fps > 0, abs(fps - fps.rounded()) < 0.01 {
+            // Exact-rate content (true 24/25/30/60): lock the link so VRR/ProMotion
+            // panels drop to the content cadence and every vsync is one frame.
+            //
+            // Fractional NTSC-family rates (23.976 = 24000/1001, 29.97, 59.94) are
+            // deliberately NOT locked: macOS quantizes fixed-rate requests to its
+            // mode grid (measured on a ProMotion MBP: requesting 23.976 grants
+            // exactly 24.000), and a 24.000 vsync grid slips one full frame against
+            // the audio-clocked 23.976 frame timeline every 1001 frames — a visible
+            // repeat/skip stutter burst every ~42 s. For those we leave the link at
+            // the panel's native cadence (120 Hz ProMotion) and let draw() pick the
+            // frame nearest each vsync — worst-case cadence error is one native
+            // refresh (~8 ms), far below the full-frame 42 ms hitch.
+            let f = Float(fps.rounded())
             link.preferredFrameRateRange = CAFrameRateRange(minimum: f, maximum: f, preferred: f)
         }
         link.add(to: .main, forMode: .common)
         displayLink = link
+        needsRedraw = true
 
         if screenObservation == nil, let window = view.window {
             screenObservation = NotificationCenter.default.addObserver(
@@ -479,10 +499,11 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         }
     }
 
-    var contentFPS: Int?
+    var contentFPS: Double?
 
     @objc func displayLinkFired(_ link: CADisplayLink) {
         nextOutputHostTime = link.targetTimestamp
+        nextOutputPeriod = link.targetTimestamp - link.timestamp
         view?.draw()
     }
 
@@ -753,9 +774,8 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         rotationQuadrant = 0
         rotation = matrix_identity_float2x2
         if let fps = newEngine.contentFPS, fps > 0 {
-            let rounded = max(1, Int(fps.rounded()))
-            contentFPS = rounded
-            ensureDisplayLink(view: view, preferredFPS: rounded)
+            contentFPS = fps
+            ensureDisplayLink(view: view, preferredFPS: fps)
         }
 
         newEngine.onStatus = { [weak self] message in
@@ -908,14 +928,13 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                     : 1.0
                 let aspect = (quadrant % 2 == 0) ? preRotAspect : 1.0 / preRotAspect
 
-                let rounded = max(1, Int(fps.rounded()))
                 await MainActor.run {
                     self.rotationQuadrant = quadrant
                     self.rotation = rotMatrix
                     self.displayAspect = aspect
                     if fps > 0 {
-                        self.contentFPS = rounded
-                        if let v = self.view { self.ensureDisplayLink(view: v, preferredFPS: rounded) }
+                        self.contentFPS = Double(fps)
+                        if let v = self.view { self.ensureDisplayLink(view: v, preferredFPS: Double(fps)) }
                     }
                     // Force re-derivation of intake uniforms (which now include rotation).
                     self.lastPixelFormat = 0
@@ -1372,23 +1391,26 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         guard renderPipelineIntake != nil,
               renderPipelineBilinear != nil,
               renderPipelineEWA != nil,
-              let drawable = view.currentDrawable,
-              let renderPassDescriptor = view.currentMTL4RenderPassDescriptor,
               let frameEvent
         else { return }
 
         // Predict which media-time will be on screen at the NEXT vsync, so the
         // frame we pull lines up with the frame we'll actually present.
         // nextOutputHostTime is the targetTimestamp from the most recent display
-        // link fire (the host time of the upcoming refresh). While a seek is in
-        // flight, freeze on the last texture instead of pulling — otherwise
-        // forward seeks visibly fast-forward through buffered frames.
+        // link fire (the host time of the upcoming refresh). Pulling half a
+        // refresh interval ahead selects the frame NEAREST that vsync rather
+        // than newest-at-or-before, centering the cadence error at ±half a
+        // refresh (matters when the link runs at panel-native rate for
+        // fractional-fps content). While a seek is in flight, freeze on the
+        // last texture instead of pulling — otherwise forward seeks visibly
+        // fast-forward through buffered frames.
         let hostTime = nextOutputHostTime > 0 ? nextOutputHostTime : CACurrentMediaTime()
+        let pullHostTime = hostTime + nextOutputPeriod / 2
         var pulledBuffer: CVPixelBuffer?
         var pulledPts: Double = .nan
 
         if let engine {
-            let mediaNs = engine.mediaTimeNs(forHostSeconds: hostTime)
+            let mediaNs = engine.mediaTimeNs(forHostSeconds: pullHostTime)
             let now = engine.currentTimeSeconds()
             if abs(now - currentTime) >= 0.1 { currentTime = now }
             if !isSeeking, let frame = engine.pullFrame(atMediaTimeNs: mediaNs) {
@@ -1401,7 +1423,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 if text != subtitleText { subtitleText = text }
             }
         } else if let output = videoOutput, let item = playerItem {
-            let time = output.itemTime(forHostTime: hostTime)
+            let time = output.itemTime(forHostTime: pullHostTime)
             let now = item.currentTime().seconds
             if abs(now - currentTime) >= 0.1 { currentTime = now }
             var displayTime = CMTime.invalid
@@ -1422,7 +1444,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 let producing = engine?.isPlaying ?? ((player?.rate ?? 0) > 0)
                 if pulledPts.isFinite, let fps = contentFPS, fps > 0, producing {
                     let t = pulledPts
-                    let expected = 1.0 / Double(fps)
+                    let expected = 1.0 / fps
                     if lastPulledItemTime >= 0 {
                         let delta = t - lastPulledItemTime
                         if delta > expected * 1.75 {
@@ -1515,7 +1537,20 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 }
         }
 
+        // No new frame due and nothing about the output changed — keep the last
+        // presented frame on the layer and skip all GPU work. With the display
+        // link at panel-native cadence (e.g. 120 Hz for 23.976 content) most
+        // ticks land here, so the render pipeline still runs at content rate.
+        if pulledBuffer == nil && !needsRedraw { return }
+
         guard let yTexture, let cbcrTexture, let linearTexture else { return }
+        // The drawable is acquired only on ticks that actually render —
+        // grabbing one per tick and not presenting it would churn the
+        // CAMetalLayer drawable pool.
+        guard let drawable = view.currentDrawable,
+              let renderPassDescriptor = view.currentMTL4RenderPassDescriptor
+        else { return }
+        needsRedraw = false
         let inputTexture = linearTexture
 
         let viewportSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
@@ -1737,6 +1772,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         scaler = nil
+        needsRedraw = true
     }
 
     func legibleOutput(_ output: AVPlayerItemLegibleOutput, didOutputAttributedStrings strings: [NSAttributedString], nativeSampleBuffers: [Any], forItemTime itemTime: CMTime) {
