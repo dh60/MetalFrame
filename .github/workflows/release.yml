@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+# Queue release runs so two pushes can't compute the same version number.
+concurrency:
+  group: release
+
+jobs:
+  release:
+    runs-on: macos-26
+    if: "!contains(github.event.head_commit.message, '[skip release]')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags, needed to find the latest version tag
+
+      - name: Compute next version
+        id: version
+        run: |
+          latest=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -1)
+          if [ -z "$latest" ]; then
+            version="0.2.0"
+          else
+            IFS=. read -r major minor patch <<< "${latest#v}"
+            version="$major.$minor.$((patch + 1))"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$version (previous: ${latest:-none})"
+
+      - name: Build
+        run: VERSION='${{ steps.version.outputs.version }}' ./build.sh
+
+      - name: Package
+        run: ditto -c -k --keepParent MetalFrame.app MetalFrame.app.zip
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            MetalFrame.app.zip \
+            --title "v${{ steps.version.outputs.version }}" \
+            --generate-notes \
+            --target "$GITHUB_SHA"

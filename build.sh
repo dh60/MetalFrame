@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Version stamped into Info.plist; CI passes the release version, local builds default to 1.0
+VERSION="${VERSION:-1.0}"
+
 # Clean build
 rm -rf MetalFrame.app
 
@@ -33,9 +36,9 @@ cat << EOF > MetalFrame.app/Contents/Info.plist
     <key>CFBundleIdentifier</key>
     <string>com.dh60.MetalFrame</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>${VERSION}</string>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>LSMinimumSystemVersion</key>
