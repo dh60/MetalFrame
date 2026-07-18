@@ -16,6 +16,8 @@ swiftc metalframe.swift \
     VideoDecodePipeline.swift \
     AudioPipeline.swift \
     PlaybackEngine.swift \
+    DTSDecoder.swift \
+    dts_tables.swift \
     -O \
     -o MetalFrame.app/Contents/MacOS/MetalFrame \
     -framework SwiftUI -framework Metal -framework MetalKit \
