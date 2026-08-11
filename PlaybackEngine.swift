@@ -85,9 +85,27 @@ struct SubtitleCue {
     let text: String
 }
 
+// The demuxer surface the engine consumes — MKVDemuxer (Matroska) and
+// MP4Demuxer (ISO-BMFF via AVAssetReader) both provide it. The packet/track
+// vocabulary stays the MKV structs; the MP4 side translates into them.
+protocol MediaDemuxer: AnyObject {
+    var tracks: [MKVTrack] { get }
+    var durationSeconds: Double? { get }
+    var hasCues: Bool { get }
+    var containerLabel: String { get }   // "MKV"/"WebM"/"MP4" for the info overlay
+    func track(number: UInt64) -> MKVTrack?
+    @discardableResult
+    func seek(toNs target: Int64) -> Int64
+    func readNextPacket() throws -> MKVPacket?
+}
+
+extension MKVDemuxer: MediaDemuxer {
+    var containerLabel: String { isWebM ? "WebM" : "MKV" }
+}
+
 final class PlaybackEngine {
     // Immutable after init.
-    private let demuxer: MKVDemuxer
+    private let demuxer: any MediaDemuxer
     let videoTrack: MKVTrack
     let audioTracks: [MKVTrack]
     let subtitleTracks: [MKVTrack]
@@ -97,6 +115,7 @@ final class PlaybackEngine {
         videoTrack.defaultDurationNs.map { 1e9 / Double($0) }
     }
     var displayAspect: Double? { videoTrack.displayAspect }
+    var containerLabel: String { demuxer.containerLabel }
 
     private let videoPipeline: VideoDecodePipeline
     private let audioPipeline = AudioPipeline()
@@ -152,8 +171,8 @@ final class PlaybackEngine {
     var selectedAudioIndex: Int { stateLock.withLock { selectedAudioIndexValue } }
     var isPlaying: Bool { synchronizer.rate > 0 }
 
-    init(url: URL) throws {
-        demuxer = try MKVDemuxer(url: url)
+    init(demuxer: any MediaDemuxer) throws {
+        self.demuxer = demuxer
         guard let video = demuxer.tracks.first(where: { $0.type == .video }) else {
             throw MKVError.corrupt("no video track")
         }
@@ -403,7 +422,17 @@ final class PlaybackEngine {
             usleep(10_000)
         }
         let playing = stateLock.withLock { desiredPlaying }
-        synchronizer.setRate(playing ? 1 : 0, time: CMTime(value: startNs, timescale: 1_000_000_000))
+        // A cue can land where no keyframe reaches back to the target (mid-GOP
+        // landing): the first displayable frame is then later than requested,
+        // and starting the clock at the target would play audio over a frozen
+        // frame until the clock catches up — up to a full GOP. Anchor the
+        // timeline on the first frame video can actually show; the renderer
+        // clips audio before it, so picture and sound start together.
+        var clockStartNs = startNs
+        if let firstPts = videoPipeline.frameQueue.firstPtsNs, firstPts > startNs {
+            clockStartNs = firstPts
+        }
+        synchronizer.setRate(playing ? 1 : 0, time: CMTime(value: clockStartNs, timescale: 1_000_000_000))
         stateLock.withLock { restarting = false }
     }
 
