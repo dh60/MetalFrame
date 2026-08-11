@@ -331,6 +331,17 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     var kernelLUT: MTLTexture!
     var transferFunction: TransferFunction = .sRGB
     var isHDR: Bool = false
+    // Content-peak metadata for the info overlay. Engine files refresh this
+    // from the decode pipeline (SEI scan can land after the first frames);
+    // AVPlayer files fill it once from the track's format description.
+    var contentLight = ContentLightInfo()
+    // Dynamic per-scene stats riding on engine frames (HDR10+/DoVi L1); the
+    // last seen value holds until the next frame that carries one.
+    var currentSceneLight: SceneLightInfo?
+    // Tone-map state actually applied this frame (for the overlay).
+    var tmActive = false
+    var tmSourceNits = 0.0
+    var tmPanelNits = 0.0
     var ycbcrMatrix: simd_float3x3 = matrix_identity_float3x3
     // Display-side orientation derived from the source track's preferredTransform.
     // rotationQuadrant ∈ {0, 1, 2, 3} = {0°, 90° CW, 180°, 270° CW}. rotation maps
@@ -729,6 +740,9 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         engine = nil
         player?.pause()
         player = nil
+        contentLight = ContentLightInfo()
+        currentSceneLight = nil
+        tmActive = false
         let ext = url.pathExtension.lowercased()
         if ext == "mkv" || ext == "webm" {
             setupEnginePipeline(url: url, view: view)
@@ -931,6 +945,27 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 default: rotMatrix = matrix_identity_float2x2
                 }
 
+                // Content peak (MaxCLL / mastering display) from the sample
+                // entry's clli/mdcv boxes, when the muxer wrote them. AVPlayer
+                // exposes no raw NALs, so SEI-only files show no line here —
+                // the engine path scans the bitstream instead.
+                if let desc = descriptions.first,
+                   let ext = CMFormatDescriptionGetExtensions(desc) as? [CFString: Any] {
+                    var light = ContentLightInfo()
+                    if let d = ext[kCMFormatDescriptionExtension_ContentLightLevelInfo] as? Data,
+                       let cll = parseCLLPayload(d) {
+                        light.maxCLL = cll.maxCLL
+                        light.maxFALL = cll.maxFALL
+                    }
+                    if let d = ext[kCMFormatDescriptionExtension_MasteringDisplayColorVolume] as? Data,
+                       let nits = parseMDCVMaxNits(d) {
+                        light.masteringMaxNits = nits
+                    }
+                    if !light.isEmpty {
+                        await MainActor.run { self.contentLight = light }
+                    }
+                }
+
                 // Pixel aspect ratio (PAR) — typically 1:1 for digital files. When
                 // present, multiplies encoded width to get display width.
                 var par: (CGFloat, CGFloat) = (1, 1)
@@ -1076,7 +1111,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
 
         // Intake uniforms: float3x3 (48) + 3× float2 (24) + float2x2 (16) + 2× float (8) = 96,
         // allocated at 112 for headroom. See IntakeUniforms in shader.
-        guard let uBuf = device.makeBuffer(length: 16, options: .storageModeShared),
+        guard let uBuf = device.makeBuffer(length: 32, options: .storageModeShared),
               let iBuf = device.makeBuffer(length: 112, options: .storageModeShared),
               let alloc = device.makeCommandAllocator(),
               let intakeF = device.makeFence(),
@@ -1114,8 +1149,10 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             struct VertexOut { float4 position [[position]]; float2 texCoord; };
 
             // Scaling/blit uniforms — vertex uses quadScale, EWA uses ratio,
-            // bilinear blit uses tf to re-encode on output.
-            struct Uniforms { float2 quadScale; float ratio; float tf; };
+            // bilinear blit uses tf to re-encode on output. tmPQ carries the
+            // tone-map endpoints as PQ-encoded signal levels (source peak,
+            // panel peak); tmPQ.x <= tmPQ.y (or zero) disables tone mapping.
+            struct Uniforms { float2 quadScale; float ratio; float tf; float2 tmPQ; float2 _pad; };
 
             // Intake uniforms — columns of float3x3 each padded to float4 stride
             // (48 bytes), then 8/8/8/16/4/4 = 96 bytes total.
@@ -1200,6 +1237,29 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 float3 lo = sqrt(3.0 * yc);
                 float3 hi = a * log(12.0 * yc - b) + c;
                 return select(hi, lo, yc <= 1.0 / 12.0);
+            }
+
+            // BT.2390 EETF: compress source-peak highlights into the panel's
+            // range with a hermite-spline knee, computed in PQ signal space on
+            // maxRGB so hue/saturation ride along unchanged. Endpoints are
+            // PQ-encoded peaks; identity when the panel covers the source.
+            static inline float3 toneMapBT2390(float3 lin, float srcPeakPQ, float dstPeakPQ) {
+                float m = max(lin.r, max(lin.g, lin.b));
+                if (m <= 1e-6) return lin;
+                float E = linearToPq(float3(m)).x / srcPeakPQ;
+                E = min(E, 1.0);   // metadata can undershoot the actual signal
+                float maxT = dstPeakPQ / srcPeakPQ;
+                float KS = 1.5 * maxT - 0.5;
+                if (E > KS) {
+                    float T = (E - KS) / (1.0 - KS);
+                    float T2 = T * T;
+                    float T3 = T2 * T;
+                    E = (2.0 * T3 - 3.0 * T2 + 1.0) * KS
+                      + (T3 - 2.0 * T2 + T) * (1.0 - KS)
+                      + (-2.0 * T3 + 3.0 * T2) * maxT;
+                }
+                float mOut = pqToLinear(float3(E * srcPeakPQ)).x;
+                return lin * (mOut / m);
             }
 
             static inline float3 encodedToLinear(float3 c, int tf) {
@@ -1307,6 +1367,9 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 float4 t = float4(tex.sample(s, in.texCoord));
                 int tf = int(u.tf + 0.5);
                 t.rgb = max(t.rgb, 0.0);
+                if (u.tmPQ.x > u.tmPQ.y && u.tmPQ.y > 0.0) {
+                    t.rgb = toneMapBT2390(t.rgb, u.tmPQ.x, u.tmPQ.y);
+                }
                 t.rgb = linearToEncoded(t.rgb, tf);
                 return half4(t);
             }
@@ -1356,6 +1419,9 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 }
                 float4 result = sum / max(wSum, 1e-6);
                 result.rgb = max(result.rgb, 0.0);
+                if (u.tmPQ.x > u.tmPQ.y && u.tmPQ.y > 0.0) {
+                    result.rgb = toneMapBT2390(result.rgb, u.tmPQ.x, u.tmPQ.y);
+                }
                 result.rgb = linearToEncoded(result.rgb, tf);
                 return half4(result);
             }
@@ -1438,6 +1504,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             if !isSeeking, let frame = engine.pullFrame(atMediaTimeNs: mediaNs) {
                 pulledBuffer = frame.buffer
                 pulledPts = Double(frame.ptsNs) / 1e9
+                if let scene = frame.sceneLight { currentSceneLight = scene }
             }
             // Subtitles come from the engine's cue store, keyed by media time.
             if selectedSubtitleIndex >= 0 {
@@ -1659,9 +1726,37 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             // displays. Only meaningful when the layer is in HDR mode.
             let edr = view.window?.screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0
             let edrLine = isHDR ? String(format: "\nPanel peak: %.0f nits", edr * 100) : ""
+            // Content peak sits under panel peak so clipping risk reads at a
+            // glance: MaxCLL (brightest pixel in the program) when present,
+            // else the mastering display's peak as the grading ceiling.
+            if let engine { contentLight = engine.contentLightInfo }
+            let contentLine: String
+            if isHDR, contentLight.maxCLL > 0 {
+                let mastered = contentLight.masteringMaxNits > 0
+                    ? String(format: " · mastered %.0f", contentLight.masteringMaxNits) : ""
+                contentLine = "\nContent peak: \(contentLight.maxCLL) nits (MaxCLL)\(mastered)"
+            } else if isHDR, contentLight.masteringMaxNits > 0 {
+                contentLine = String(format: "\nContent peak: %.0f nits (mastering)", contentLight.masteringMaxNits)
+            } else {
+                contentLine = ""
+            }
+            // Dynamic metadata + tone-map status. Scene peak updates live as
+            // the bitstream's per-scene stats change; the tone-map line shows
+            // what the shader is doing about it this frame.
+            var sceneLine = ""
+            if let scene = currentSceneLight {
+                sceneLine = String(format: "\nScene peak: %.0f nits · avg %.0f (%@)",
+                                   scene.peakNits, scene.avgNits, scene.sourceLabel)
+            }
+            var tmLine = ""
+            if tmActive {
+                tmLine = String(format: "\nTone map: BT.2390 %.0f → %.0f nits", tmSourceNits, tmPanelNits)
+            } else if isHDR, tmSourceNits > 0 {
+                tmLine = "\nTone map: off (fits panel)"
+            }
             let statsLine = String(format: "\nFPS: %.1f · Dropped: %d", measuredFPS, droppedFrames)
             let engineLine = engine.map { "\nEngine: native \($0.containerLabel) · \($0.usingHardwareDecode ? "hardware" : "software") decode" } ?? ""
-            let newInfo = "Input: \(inputTexture.width)x\(inputTexture.height)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)\nColorspace: \(colorspaceLabel)\(edrLine)\(statsLine)\(engineLine)"
+            let newInfo = "Input: \(inputTexture.width)x\(inputTexture.height)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)\nColorspace: \(colorspaceLabel)\(edrLine)\(contentLine)\(sceneLine)\(tmLine)\(statsLine)\(engineLine)"
             if newInfo != info { info = newInfo }
         }
 
@@ -1682,12 +1777,34 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         // Both EWA and the bilinear blit need the output TF — the final pass to the
         // drawable is the one and only place we re-encode linear → source-TF.
         let tfFlag: Float = Float(transferFunction.rawValue)
+        // Tone mapping: only for PQ content whose current source peak exceeds
+        // what the panel can show right now (EDR headroom moves with the
+        // brightness slider, so this re-evaluates every frame). Source peak is
+        // the dynamic scene value when the bitstream provides one (HDR10+/
+        // DoVi L1), else static MaxCLL, else the mastering display peak.
+        // Without any metadata we keep the old clip-to-EDR behavior.
+        let panelNits = Double(view.window?.screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0) * 100.0
+        var sourceNits = 0.0
+        if let scene = currentSceneLight {
+            sourceNits = scene.peakNits
+        } else if contentLight.maxCLL > 0 {
+            sourceNits = Double(contentLight.maxCLL)
+        } else if contentLight.masteringMaxNits > 0 {
+            sourceNits = contentLight.masteringMaxNits
+        }
+        tmActive = transferFunction == .pq && sourceNits > panelNits && panelNits > 0
+        tmSourceNits = sourceNits
+        tmPanelNits = panelNits
         do {
             let p = uniformsBuffer.contents().assumingMemoryBound(to: Float.self)
             p[0] = finalQuadScale.x
             p[1] = finalQuadScale.y
             p[2] = ratioEWA
             p[3] = tfFlag
+            p[4] = tmActive ? Float(pqEncodeNits(sourceNits)) : 0
+            p[5] = tmActive ? Float(pqEncodeNits(panelNits)) : 0
+            p[6] = 0
+            p[7] = 0
         }
 
         residencySet.removeAllAllocations()
