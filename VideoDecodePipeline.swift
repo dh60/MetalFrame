@@ -210,6 +210,39 @@ private func withNALPointers(_ nalus: [[UInt8]],
     return recurse(0, &acc)
 }
 
+// MARK: - HDR static metadata (content peak for the info overlay)
+
+// MaxCLL/MaxFALL and the mastering display peak, wherever they were found:
+// container-level (format-description extensions) or in-band SEI NALs.
+struct ContentLightInfo {
+    var maxCLL = 0               // nits; 0 = unknown
+    var maxFALL = 0
+    var masteringMaxNits = 0.0   // nits; 0 = unknown
+    var isEmpty: Bool { maxCLL == 0 && masteringMaxNits == 0 }
+}
+
+// Both payloads are SEI-shaped whether they come from a CMFormatDescription
+// extension, an MKV Colour element (the engine re-encodes it to this shape),
+// or the bitstream itself.
+func parseCLLPayload(_ d: Data) -> (maxCLL: Int, maxFALL: Int)? {
+    let b = [UInt8](d)
+    guard b.count >= 4 else { return nil }
+    let cll = Int(b[0]) << 8 | Int(b[1])
+    let fall = Int(b[2]) << 8 | Int(b[3])
+    guard cll > 0 else { return nil }
+    return (cll, fall)
+}
+
+// mastering_display_colour_volume: 8×u16 chromaticities, then max/min
+// luminance as u32 in 0.0001 cd/m² units — only the max matters here.
+func parseMDCVMaxNits(_ d: Data) -> Double? {
+    let b = [UInt8](d)
+    guard b.count >= 24 else { return nil }
+    let maxL = UInt32(b[16]) << 24 | UInt32(b[17]) << 16 | UInt32(b[18]) << 8 | UInt32(b[19])
+    let nits = Double(maxL) / 10000.0
+    return nits > 0 ? nits : nil
+}
+
 // MARK: - Sample buffer packaging (shared with the audio pipeline)
 
 func makeCompressedSampleBuffer(data: Data, format: CMFormatDescription,
@@ -251,6 +284,7 @@ struct DecodedFrame {
     let ptsNs: Int64
     let durationNs: Int64
     let buffer: CVImageBuffer
+    var sceneLight: SceneLightInfo? = nil   // per-scene HDR stats (HDR10+/DoVi L1)
 }
 
 // Bounded queue of display-ordered decoded frames. The producer (VT output
@@ -345,9 +379,31 @@ final class VideoDecodePipeline {
         set { reorderLock.withLock { dropBeforeNsValue = newValue } }
     }
 
+    // Content-peak metadata: seeded from the format description, else scanned
+    // out of keyframe SEIs (decode thread writes, renderer reads).
+    private let lightLock = NSLock()
+    private var lightInfoValue = ContentLightInfo()
+    private var seiKeyframesScanned = 0
+    var contentLightInfo: ContentLightInfo { lightLock.withLock { lightInfoValue } }
+
+    // Dynamic (per-frame) HDR metadata parsed at submit time, keyed by PTS so
+    // it survives decode reorder, and attached to the frame on output.
+    private var pendingSceneLight: [Int64: SceneLightInfo] = [:]
+
     init(track: MKVTrack) throws {
         self.track = track
         formatDescription = try makeVideoFormatDescription(track: track)
+        if let ext = CMFormatDescriptionGetExtensions(formatDescription) as? [CFString: Any] {
+            if let d = ext[kCMFormatDescriptionExtension_ContentLightLevelInfo] as? Data,
+               let cll = parseCLLPayload(d) {
+                lightInfoValue.maxCLL = cll.maxCLL
+                lightInfoValue.maxFALL = cll.maxFALL
+            }
+            if let d = ext[kCMFormatDescriptionExtension_MasteringDisplayColorVolume] as? Data,
+               let nits = parseMDCVMaxNits(d) {
+                lightInfoValue.masteringMaxNits = nits
+            }
+        }
 
         // Mirror the pixel formats the AVPlayer path negotiated — the Metal
         // intake shader handles exactly these four.
@@ -411,6 +467,14 @@ final class VideoDecodePipeline {
     // decode ~6 frames in front of the display.
     func decode(_ packet: MKVPacket) {
         guard let session else { return }
+        if packet.keyframe { scanKeyframeSEI(packet.data) }
+        if let scene = extractSceneLight(sampleData: packet.data, codecID: track.codecID,
+                                         codecPrivate: track.codecPrivate) {
+            lightLock.withLock {
+                if pendingSceneLight.count > 256 { pendingSceneLight.removeAll() }  // leak guard
+                pendingSceneLight[packet.ptsNs] = scene
+            }
+        }
         let duration = packet.durationNs ?? track.defaultDurationNs.map(Int64.init)
         guard let sampleBuffer = try? makeCompressedSampleBuffer(
             data: packet.data, format: formatDescription,
@@ -434,10 +498,13 @@ final class VideoDecodePipeline {
             if status != noErr { decodeErrorCount += 1 }
             return
         }
+        let framePtsNs = pts.isNumeric ? pts.convertScale(1_000_000_000, method: .default).value : 0
+        let scene = lightLock.withLock { pendingSceneLight.removeValue(forKey: framePtsNs) }
         let frame = DecodedFrame(
-            ptsNs: pts.isNumeric ? pts.convertScale(1_000_000_000, method: .default).value : 0,
+            ptsNs: framePtsNs,
             durationNs: duration.isNumeric ? duration.convertScale(1_000_000_000, method: .default).value : 0,
-            buffer: imageBuffer)
+            buffer: imageBuffer,
+            sceneLight: scene)
 
         // Push in decode order, emit in presentation order once the heap is
         // deeper than the reorder window.
@@ -475,6 +542,7 @@ final class VideoDecodePipeline {
 
     // Seek: reject producers, drain VT, clear all buffered frames.
     func flush() {
+        lightLock.withLock { pendingSceneLight.removeAll() }
         frameQueue.beginFlush()
         if let session {
             VTDecompressionSessionWaitForAsynchronousFrames(session)
@@ -484,6 +552,93 @@ final class VideoDecodePipeline {
         reorderLock.unlock()
         frameQueue.beginFlush()  // clear anything appended during the drain
         frameQueue.endFlush()
+    }
+
+    // MARK: HDR static-metadata SEI scan (decode thread)
+
+    // WEB-DLs often carry MaxCLL/mastering ONLY as bitstream SEIs — no
+    // container boxes, and VT does not lift SEI metadata onto output buffers
+    // (verified empirically) — so we read the NALs ourselves. Keyframes only,
+    // and we stop once found or after enough fruitless tries.
+    private func scanKeyframeSEI(_ data: Data) {
+        lightLock.lock()
+        let done = !lightInfoValue.isEmpty || seiKeyframesScanned >= 32
+        if !done { seiKeyframesScanned += 1 }
+        lightLock.unlock()
+        guard !done else { return }
+        guard let found = Self.parseHDRStaticSEI(sampleData: data, codecID: track.codecID,
+                                                 codecPrivate: track.codecPrivate) else { return }
+        lightLock.withLock {
+            if lightInfoValue.maxCLL == 0 {
+                lightInfoValue.maxCLL = found.maxCLL
+                lightInfoValue.maxFALL = found.maxFALL
+            }
+            if lightInfoValue.masteringMaxNits == 0 {
+                lightInfoValue.masteringMaxNits = found.masteringMaxNits
+            }
+        }
+    }
+
+    // Walk the length-prefixed NALs of one sample for SEI payloads 137
+    // (mastering_display_colour_volume) and 144 (content_light_level_info).
+    static func parseHDRStaticSEI(sampleData: Data, codecID: String,
+                                  codecPrivate: Data?) -> ContentLightInfo? {
+        let isHEVC = codecID == "V_MPEGH/ISO/HEVC"
+        guard isHEVC || codecID == "V_MPEG4/ISO/AVC" else { return nil }
+        // NAL length-prefix size from the config atom (avcC byte 4 / hvcC
+        // byte 21, low two bits); 4 is the overwhelming default.
+        var lengthSize = 4
+        if let p = codecPrivate {
+            let b = [UInt8](p)
+            if isHEVC, b.count > 21 { lengthSize = Int(b[21] & 0x3) + 1 }
+            if !isHEVC, b.count > 4 { lengthSize = Int(b[4] & 0x3) + 1 }
+        }
+        let bytes = [UInt8](sampleData)
+        var info = ContentLightInfo()
+        var off = 0
+        while off + lengthSize <= bytes.count {
+            var nalLen = 0
+            for i in 0..<lengthSize { nalLen = (nalLen << 8) | Int(bytes[off + i]) }
+            off += lengthSize
+            guard nalLen > 0, off + nalLen <= bytes.count else { break }
+            let headerLen = isHEVC ? 2 : 1
+            let nalType = isHEVC ? Int(bytes[off] >> 1) & 0x3F : Int(bytes[off]) & 0x1F
+            let isSEI = isHEVC ? (nalType == 39 || nalType == 40) : (nalType == 6)
+            if isSEI, nalLen > headerLen {
+                // De-escape the RBSP (00 00 03 → 00 00) before payload parsing.
+                var rbsp = [UInt8]()
+                rbsp.reserveCapacity(nalLen - headerLen)
+                var zeros = 0
+                for i in (off + headerLen)..<(off + nalLen) {
+                    let b = bytes[i]
+                    if zeros >= 2 && b == 3 { zeros = 0; continue }
+                    zeros = (b == 0) ? zeros + 1 : 0
+                    rbsp.append(b)
+                }
+                var p = 0
+                while p + 1 < rbsp.count, rbsp[p] != 0x80 {
+                    var type = 0
+                    while p < rbsp.count, rbsp[p] == 0xFF { type += 255; p += 1 }
+                    guard p < rbsp.count else { break }
+                    type += Int(rbsp[p]); p += 1
+                    var size = 0
+                    while p < rbsp.count, rbsp[p] == 0xFF { size += 255; p += 1 }
+                    guard p < rbsp.count else { break }
+                    size += Int(rbsp[p]); p += 1
+                    guard p + size <= rbsp.count else { break }
+                    let payload = Data(rbsp[p..<p + size])
+                    if type == 144, let cll = parseCLLPayload(payload) {
+                        info.maxCLL = cll.maxCLL
+                        info.maxFALL = cll.maxFALL
+                    } else if type == 137, let nits = parseMDCVMaxNits(payload) {
+                        info.masteringMaxNits = nits
+                    }
+                    p += size
+                }
+            }
+            off += nalLen
+        }
+        return info.isEmpty ? nil : info
     }
 
     // MARK: min-heap by PTS (callers hold reorderLock)

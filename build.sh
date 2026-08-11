@@ -14,6 +14,7 @@ mkdir -p MetalFrame.app/Contents/MacOS
 swiftc metalframe.swift \
     MKVDemuxer.swift \
     MP4Demuxer.swift \
+    HDRDynamicMetadata.swift \
     VideoDecodePipeline.swift \
     AudioPipeline.swift \
     PlaybackEngine.swift \

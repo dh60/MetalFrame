@@ -116,6 +116,7 @@ final class PlaybackEngine {
     }
     var displayAspect: Double? { videoTrack.displayAspect }
     var containerLabel: String { demuxer.containerLabel }
+    var contentLightInfo: ContentLightInfo { videoPipeline.contentLightInfo }
 
     private let videoPipeline: VideoDecodePipeline
     private let audioPipeline = AudioPipeline()
