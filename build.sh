@@ -13,6 +13,7 @@ mkdir -p MetalFrame.app/Contents/MacOS
 # Compile the Swift code + link (optimized — swiftc defaults to -Onone)
 swiftc metalframe.swift \
     MKVDemuxer.swift \
+    MP4Demuxer.swift \
     VideoDecodePipeline.swift \
     AudioPipeline.swift \
     PlaybackEngine.swift \

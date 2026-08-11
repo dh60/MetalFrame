@@ -733,19 +733,41 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         if ext == "mkv" || ext == "webm" {
             setupEnginePipeline(url: url, view: view)
         } else {
-            setupVideoPipeline(url: url, view: view)
+            // MP4/MOV: AVPlayer, unless AVFoundation refuses to decode the
+            // video track. WEB-DLs tagged 'hev1' (in-band parameter sets
+            // allowed) are demuxable but not decodable by AVPlayer, while
+            // VideoToolbox decodes the same stream fine once the format
+            // description is built from the hvcC sample entry — those route
+            // through the engine via the AVAssetReader-backed demuxer.
+            currentSetupTask = Task { @MainActor [weak self] in
+                let asset = AVURLAsset(url: url)
+                var avfDecodable = true
+                if let vTrack = try? await asset.loadTracks(withMediaType: .video).first {
+                    avfDecodable = (try? await vTrack.load(.isDecodable)) ?? true
+                }
+                guard let self, !Task.isCancelled else { return }
+                if !avfDecodable, let demuxer = try? await MP4Demuxer(asset: asset) {
+                    self.setupEnginePipeline(url: url, view: view, demuxer: demuxer)
+                } else {
+                    // Decodable normally — or broken in a way the engine can't
+                    // rescue either, and then AVPlayer surfaces the error.
+                    self.setupVideoPipeline(url: url, view: view)
+                }
+            }
         }
     }
 
     // MKV/WebM go through the native engine: our own Matroska demuxer feeding
-    // VideoToolbox and AVSampleBufferAudioRenderer. The AVPlayer path below
-    // remains for MP4/MOV until Phase 4 unifies the two.
+    // VideoToolbox and AVSampleBufferAudioRenderer. MP4/MOV files AVFoundation
+    // can't decode ride the same engine behind an MP4Demuxer passed in by the
+    // router; the AVPlayer path below remains for decodable MP4/MOV until
+    // Phase 4 unifies the two.
     @MainActor
-    func setupEnginePipeline(url: URL, view: MTKView) {
+    func setupEnginePipeline(url: URL, view: MTKView, demuxer: (any MediaDemuxer)? = nil) {
         setPlaybackActivity(false)
         let newEngine: PlaybackEngine
         do {
-            newEngine = try PlaybackEngine(url: url)
+            newEngine = try PlaybackEngine(demuxer: demuxer ?? MKVDemuxer(url: url))
         } catch {
             errorMessage = "Cannot play this file: \(error)"
             return
@@ -1638,7 +1660,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             let edr = view.window?.screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0
             let edrLine = isHDR ? String(format: "\nPanel peak: %.0f nits", edr * 100) : ""
             let statsLine = String(format: "\nFPS: %.1f · Dropped: %d", measuredFPS, droppedFrames)
-            let engineLine = engine.map { "\nEngine: native MKV · \($0.usingHardwareDecode ? "hardware" : "software") decode" } ?? ""
+            let engineLine = engine.map { "\nEngine: native \($0.containerLabel) · \($0.usingHardwareDecode ? "hardware" : "software") decode" } ?? ""
             let newInfo = "Input: \(inputTexture.width)x\(inputTexture.height)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)\nColorspace: \(colorspaceLabel)\(edrLine)\(statsLine)\(engineLine)"
             if newInfo != info { info = newInfo }
         }
