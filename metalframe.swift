@@ -188,6 +188,16 @@ struct MetalView: View {
             flashStatusOverlay()
             return .handled
         }
+        // A/B the HDR tone mapper (only affects PQ content that exceeds the
+        // panel's current EDR headroom; off = the old clip-to-EDR behavior).
+        .onKeyPress("t") {
+            renderer.toneMapEnabled.toggle()
+            renderer.statusLabel = renderer.toneMapEnabled
+                ? "Tone mapping: on (BT.2390)"
+                : "Tone mapping: off (clip to panel)"
+            flashStatusOverlay()
+            return .handled
+        }
         // Engine-initiated status messages (audio fallback notes, track
         // switches it performs on its own) flash the same overlay the
         // keyboard shortcuts use.
@@ -342,6 +352,13 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     var tmActive = false
     var tmSourceNits = 0.0
     var tmPanelNits = 0.0
+    // 't' key A/B toggle. Re-renders the held frame immediately when paused —
+    // the needsRedraw path re-runs the full pipeline (intake → scale → tone
+    // map → encode) on the retained textures, so a paused toggle shows exactly
+    // what playback would show.
+    var toneMapEnabled = true {
+        didSet { needsRedraw = true }
+    }
     var ycbcrMatrix: simd_float3x3 = matrix_identity_float3x3
     // Display-side orientation derived from the source track's preferredTransform.
     // rotationQuadrant ∈ {0, 1, 2, 3} = {0°, 90° CW, 180°, 270° CW}. rotation maps
@@ -1751,6 +1768,8 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             var tmLine = ""
             if tmActive {
                 tmLine = String(format: "\nTone map: BT.2390 %.0f → %.0f nits", tmSourceNits, tmPanelNits)
+            } else if isHDR, !toneMapEnabled {
+                tmLine = "\nTone map: DISABLED (t)"
             } else if isHDR, tmSourceNits > 0 {
                 tmLine = "\nTone map: off (fits panel)"
             }
@@ -1792,7 +1811,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         } else if contentLight.masteringMaxNits > 0 {
             sourceNits = contentLight.masteringMaxNits
         }
-        tmActive = transferFunction == .pq && sourceNits > panelNits && panelNits > 0
+        tmActive = toneMapEnabled && transferFunction == .pq && sourceNits > panelNits && panelNits > 0
         tmSourceNits = sourceNits
         tmPanelNits = panelNits
         do {
