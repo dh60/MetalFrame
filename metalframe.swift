@@ -219,6 +219,19 @@ struct MetalView: View {
     }
 }
 
+// The played portion of the track: the full track's capsule clipped to the
+// fill width, so the fill hugs the pill's rounded caps at either end instead
+// of poking square corners past them.
+struct ProgressFillShape: Shape {
+    var trackWidth: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        let track = CGRect(x: rect.minX, y: rect.minY, width: trackWidth, height: rect.height)
+        return Path(roundedRect: track, cornerRadius: rect.height / 2)
+            .intersection(Path(rect))
+    }
+}
+
 struct ProgressBar: View {
     @Binding var currentTime: Double
     let duration: Double
@@ -248,7 +261,7 @@ struct ProgressBar: View {
 
                 Color.clear
                     .frame(width: geometry.size.width * CGFloat((isDragging ? dragTime : currentTime) / duration))
-                    .glassEffect(.regular.tint(.purple.opacity(0.1)))
+                    .glassEffect(.regular.tint(.purple.opacity(0.1)), in: ProgressFillShape(trackWidth: geometry.size.width))
                     .opacity(isVisible ? 1 : 0)
 
                 if isVisible {
