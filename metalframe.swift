@@ -509,19 +509,32 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         guard let screen else { return }
         displayLink?.invalidate()
         let link = screen.displayLink(target: self, selector: #selector(displayLinkFired(_:)))
-        if let fps = preferredFPS, fps > 0, abs(fps - fps.rounded()) < 0.01 {
-            // Exact-rate content (true 24/25/30/60): lock the link so VRR/ProMotion
-            // panels drop to the content cadence and every vsync is one frame.
+        let panelMaxHz = screen.maximumFramesPerSecond
+        if let fps = preferredFPS, fps > 0, abs(fps - fps.rounded()) < 0.01,
+           panelMaxHz > 0, panelMaxHz % Int(fps.rounded()) == 0 {
+            // Exact-rate content whose rate divides the panel's maximum refresh
+            // (24/30/60 on a 120 Hz ProMotion panel, 30/60 on a 60 Hz panel): lock
+            // the link so VRR panels drop to the content cadence and every vsync
+            // is one frame.
             //
-            // Fractional NTSC-family rates (23.976 = 24000/1001, 29.97, 59.94) are
-            // deliberately NOT locked: macOS quantizes fixed-rate requests to its
-            // mode grid (measured on a ProMotion MBP: requesting 23.976 grants
-            // exactly 24.000), and a 24.000 vsync grid slips one full frame against
-            // the audio-clocked 23.976 frame timeline every 1001 frames — a visible
-            // repeat/skip stutter burst every ~42 s. For those we leave the link at
-            // the panel's native cadence (120 Hz ProMotion) and let draw() pick the
-            // frame nearest each vsync — worst-case cadence error is one native
-            // refresh (~8 ms), far below the full-frame 42 ms hitch.
+            // macOS quantizes fixed-rate CAFrameRateRange requests to a grid of
+            // the panel maximum over an integer (measured on a ProMotion MBP,
+            // 120/n: requesting 23.976 grants 24.000, requesting 25 grants
+            // 24.000, requesting 50 grants 60). Two families are therefore
+            // deliberately NOT locked:
+            //  - Fractional NTSC-family rates (23.976 = 24000/1001, 29.97, 59.94):
+            //    a 24.000 vsync grid slips one full frame against the
+            //    audio-clocked 23.976 timeline every 1001 frames — a visible
+            //    repeat/skip burst every ~42 s.
+            //  - Integer rates that don't divide the panel maximum (PAL 25/50 on
+            //    a 120 Hz panel, 24 on a 60 Hz panel): the granted grid is a
+            //    different rate outright, so the timeline slips a whole frame
+            //    every second — 25 fps on the 24 Hz grid it actually gets skips
+            //    one frame per second, continuously.
+            // Both leave the link at the panel's native cadence (120 Hz
+            // ProMotion) and let draw() pick the frame nearest each vsync —
+            // worst-case cadence error is half a native refresh (~4 ms), far
+            // below a full-frame 40 ms hitch.
             let f = Float(fps.rounded())
             link.preferredFrameRateRange = CAFrameRateRange(minimum: f, maximum: f, preferred: f)
         }
@@ -1822,7 +1835,12 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             } else if isHDR, tmSourceNits > 0 {
                 tmLine = "\nTone map: off (fits panel)"
             }
-            let statsLine = String(format: "\nFPS: %.1f · Dropped: %d", measuredFPS, droppedFrames)
+            // Vsync cadence the display link actually runs at (locked to the
+            // content rate, or panel-native) — a mismatch against the content
+            // fps is the first thing to check when Dropped climbs steadily.
+            let vsyncHz = nextOutputPeriod > 0 ? 1 / nextOutputPeriod : 0
+            let statsLine = String(format: "\nFPS: %.1f · Dropped: %d · Vsync: %.0f Hz",
+                                   measuredFPS, droppedFrames, vsyncHz)
             let engineLine = engine.map { "\nEngine: native \($0.containerLabel) · \($0.usingHardwareDecode ? "hardware" : "software") decode" } ?? ""
             let newInfo = "Input: \(inputTexture.width)x\(inputTexture.height)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)\nColorspace: \(colorspaceLabel)\(edrLine)\(contentLine)\(sceneLine)\(tmLine)\(statsLine)\(engineLine)"
             if newInfo != info { info = newInfo }
