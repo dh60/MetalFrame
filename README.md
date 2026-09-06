@@ -23,7 +23,9 @@ A video player for macOS using Metal 4 and MetalFX for reference playback.
 | f | Toggle Fullscreen |
 | s | Cycle subtitle tracks |
 | a | Cycle audio tracks |
+| t | Toggle HDR tone mapping (BT.2390 vs clip to panel) |
 | i | Toggle info overlay |
+| ⌘O | Open file |
 | Esc | Quit |
 ## Info Overlay
 Press `i` to show the info overlay, which displays video details and provides:

@@ -227,7 +227,15 @@ final class MP4Demuxer: MediaDemuxer {
                 let output = AVAssetReaderTrackOutput(track: streams[i].avTrack, outputSettings: nil)
                 output.alwaysCopiesSampleData = false   // we copy into packet Data ourselves
                 guard newReader.canAdd(output) else {
-                    throw MKVError.io("AVAssetReader rejected track \(streams[i].track.number)")
+                    // One odd side track must not take the whole file down:
+                    // leave it finished (silent/absent) and keep going. Only
+                    // the video track is fatal.
+                    if streams[i].track.type == .video {
+                        throw MKVError.io("AVAssetReader rejected the video track")
+                    }
+                    NSLog("MetalFrame MP4Demuxer: skipping track %llu (reader rejected it)",
+                          streams[i].track.number)
+                    continue
                 }
                 newReader.add(output)
                 streams[i].output = output
@@ -298,11 +306,11 @@ final class MP4Demuxer: MediaDemuxer {
         // CMSampleBuffer): split on the per-sample size + timing arrays.
         var sizes = [Int](repeating: 0, count: sampleCount)
         var timings = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: sampleCount)
-        var needed = 0
+        var sizesNeeded = 0, timingsNeeded = 0
         guard CMSampleBufferGetSampleSizeArray(sb, entryCount: sampleCount,
-                                               arrayToFill: &sizes, entriesNeededOut: &needed) == noErr,
+                                               arrayToFill: &sizes, entriesNeededOut: &sizesNeeded) == noErr,
               CMSampleBufferGetOutputSampleTimingInfoArray(sb, entryCount: sampleCount,
-                                                           arrayToFill: &timings, entriesNeededOut: &needed) == noErr
+                                                           arrayToFill: &timings, entriesNeededOut: &timingsNeeded) == noErr
         else {
             // Can't split — hand over the whole buffer; the Dolby syncframe
             // splitter downstream copes with multi-frame packets.
@@ -311,6 +319,22 @@ final class MP4Demuxer: MediaDemuxer {
             if dur == 0 { dur = nil }
             return makePacket(streamIndex: i, ptsNs: pts, dtsNs: nil, durationNs: dur,
                               sync: true, payload: data).map { [$0] } ?? []
+        }
+        // CoreMedia may describe a uniform buffer with a single entry ("all
+        // samples share this size / timing"); expand it so the split below
+        // sees one entry per sample.
+        if sizesNeeded == 1 {
+            for j in 1..<sampleCount { sizes[j] = sizes[0] }
+        }
+        if timingsNeeded == 1 {
+            for j in 1..<sampleCount {
+                timings[j] = timings[0]
+                let advance = CMTimeMultiply(timings[0].duration, multiplier: Int32(j))
+                timings[j].presentationTimeStamp = CMTimeAdd(timings[0].presentationTimeStamp, advance)
+                if timings[0].decodeTimeStamp.isNumeric {
+                    timings[j].decodeTimeStamp = CMTimeAdd(timings[0].decodeTimeStamp, advance)
+                }
+            }
         }
         var out: [(Int64, MKVPacket)] = []
         var offset = 0

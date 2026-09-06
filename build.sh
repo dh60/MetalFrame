@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "$0")"
 
 # Version stamped into Info.plist; CI passes the release version, local builds default to 1.0
 VERSION="${VERSION:-1.0}"

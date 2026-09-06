@@ -95,11 +95,20 @@ func makeVideoFormatDescription(track: MKVTrack) throws -> CMVideoFormatDescript
         }
     }
 
-    if ext[kCMFormatDescriptionExtension_ColorPrimaries] == nil,
+    // A partial Colour element (e.g. primaries + matrix but no transfer) is
+    // common from remuxers; the SPS VUI fills whatever the container left out.
+    if ext[kCMFormatDescriptionExtension_ColorPrimaries] == nil
+        || ext[kCMFormatDescriptionExtension_TransferFunction] == nil
+        || ext[kCMFormatDescriptionExtension_YCbCrMatrix] == nil,
        let vuiExt = vuiColorExtensions(codecID: track.codecID, codecPrivate: priv) {
         for (k, v) in vuiExt where ext[k] == nil { ext[k] = v }
     }
 
+    // Container-supplied dimensions feed a trapping Int32 conversion below;
+    // reject nonsense before it can crash the open.
+    guard (1...32768).contains(track.pixelWidth), (1...32768).contains(track.pixelHeight) else {
+        throw MKVError.corrupt("video dimensions \(track.pixelWidth)x\(track.pixelHeight) out of range")
+    }
     var desc: CMVideoFormatDescription?
     let status = CMVideoFormatDescriptionCreate(
         allocator: kCFAllocatorDefault,
@@ -139,7 +148,7 @@ private func vuiColorExtensions(codecID: String, codecPrivate priv: Data) -> [CF
             guard off + len <= p.count else { return nil }
             nalus.append(Array(p[off..<off + len])); off += len
         }
-        guard nalus.count >= 2 else { return nil }
+        guard nalus.count >= 2, nalus.count <= 32 else { return nil }
         let status = withNALPointers(nalus) { ptrs, sizes in
             CMVideoFormatDescriptionCreateFromH264ParameterSets(
                 allocator: kCFAllocatorDefault,
@@ -156,16 +165,19 @@ private func vuiColorExtensions(codecID: String, codecPrivate priv: Data) -> [CF
         let numArrays = Int(p[off]); off += 1
         for _ in 0..<numArrays {
             guard off + 3 <= p.count else { return nil }
-            off += 1  // array_completeness + NAL_unit_type
+            let nalType = Int(p[off] & 0x3F); off += 1  // array_completeness + NAL_unit_type
             let numNALs = (Int(p[off]) << 8) | Int(p[off + 1]); off += 2
             for _ in 0..<numNALs {
                 guard off + 2 <= p.count else { return nil }
                 let len = (Int(p[off]) << 8) | Int(p[off + 1]); off += 2
                 guard off + len <= p.count else { return nil }
-                nalus.append(Array(p[off..<off + len])); off += len
+                // hvcC arrays may also carry SEI NALs (39/40); the parameter-set
+                // API only accepts VPS/SPS/PPS (32/33/34).
+                if (32...34).contains(nalType) { nalus.append(Array(p[off..<off + len])) }
+                off += len
             }
         }
-        guard nalus.count >= 3 else { return nil }
+        guard nalus.count >= 3, nalus.count <= 32 else { return nil }
         let status = withNALPointers(nalus) { ptrs, sizes in
             CMVideoFormatDescriptionCreateFromHEVCParameterSets(
                 allocator: kCFAllocatorDefault,
@@ -295,6 +307,10 @@ final class FrameQueue {
     private var frames: [DecodedFrame] = []
     private var flushing = false
     private let capacity: Int
+    // PTS of the newest frame handed to the consumer; anything older that
+    // arrives late (reorder window too shallow for the stream) is discarded
+    // rather than shown as a backwards step.
+    private var lastTakenPtsNs = Int64.min
 
     init(capacity: Int = 6) {
         self.capacity = capacity
@@ -309,7 +325,11 @@ final class FrameQueue {
             condition.wait()
         }
         if flushing { return false }
-        frames.append(frame)
+        if frame.ptsNs < lastTakenPtsNs { return true }   // late: superseded
+        // Sorted insert keeps take()'s "first is oldest" scan valid even when
+        // the producer emits slightly out of order.
+        let at = frames.lastIndex(where: { $0.ptsNs <= frame.ptsNs }).map { $0 + 1 } ?? 0
+        frames.insert(frame, at: at)
         return true
     }
 
@@ -323,7 +343,10 @@ final class FrameQueue {
             picked = first
             frames.removeFirst()
         }
-        if picked != nil { condition.broadcast() }
+        if let picked {
+            lastTakenPtsNs = picked.ptsNs
+            condition.broadcast()
+        }
         return picked
     }
 
@@ -345,6 +368,7 @@ final class FrameQueue {
         condition.lock()
         flushing = true
         frames.removeAll()
+        lastTakenPtsNs = Int64.min
         condition.broadcast()
         condition.unlock()
     }
@@ -363,7 +387,6 @@ final class VideoDecodePipeline {
     let formatDescription: CMVideoFormatDescription
     let frameQueue = FrameQueue()
     private(set) var usingHardware = false
-    private(set) var decodeErrorCount = 0
 
     private var session: VTDecompressionSession?
     // Decode-order → presentation-order reorder buffer: min-heap by PTS, popped
@@ -389,6 +412,11 @@ final class VideoDecodePipeline {
     // Dynamic (per-frame) HDR metadata parsed at submit time, keyed by PTS so
     // it survives decode reorder, and attached to the frame on output.
     private var pendingSceneLight: [Int64: SceneLightInfo] = [:]
+    // HDR10+/DoVi metadata rides on every frame or on none: after this many
+    // consecutive frames without any, stop walking NALs (decode thread only).
+    private var framesWithoutSceneLight = 0
+    private var scanSceneLight = true
+    private static let sceneLightGiveUpAfter = 600
 
     init(track: MKVTrack) throws {
         self.track = track
@@ -455,12 +483,21 @@ final class VideoDecodePipeline {
         }
     }
 
-    deinit {
+    // Tear the session down while self is still fully alive — the VT callback
+    // refcon is unretained, so this must not be left to deinit racing a late
+    // callback. Producers are put in flush mode first so a callback parked on
+    // a full queue can't block the drain. Called from the engine's shutdown;
+    // deinit is only the safety net.
+    func invalidate() {
+        frameQueue.beginFlush()
         if let session {
             VTDecompressionSessionWaitForAsynchronousFrames(session)
             VTDecompressionSessionInvalidate(session)
         }
+        session = nil
     }
+
+    deinit { invalidate() }
 
     // Called on the engine's video decode thread. Blocks (via FrameQueue)
     // when playback is far enough ahead — that's the backpressure that keeps
@@ -468,38 +505,38 @@ final class VideoDecodePipeline {
     func decode(_ packet: MKVPacket) {
         guard let session else { return }
         if packet.keyframe { scanKeyframeSEI(packet.data) }
-        if let scene = extractSceneLight(sampleData: packet.data, codecID: track.codecID,
-                                         codecPrivate: track.codecPrivate) {
-            lightLock.withLock {
-                if pendingSceneLight.count > 256 { pendingSceneLight.removeAll() }  // leak guard
-                pendingSceneLight[packet.ptsNs] = scene
+        if scanSceneLight {
+            if let scene = extractSceneLight(sampleData: packet.data, codecID: track.codecID,
+                                             codecPrivate: track.codecPrivate) {
+                framesWithoutSceneLight = 0
+                lightLock.withLock {
+                    if pendingSceneLight.count > 256 { pendingSceneLight.removeAll() }  // leak guard
+                    pendingSceneLight[packet.ptsNs] = scene
+                }
+            } else {
+                framesWithoutSceneLight += 1
+                if framesWithoutSceneLight >= Self.sceneLightGiveUpAfter { scanSceneLight = false }
             }
         }
-        let duration = packet.durationNs ?? track.defaultDurationNs.map(Int64.init)
+        let duration = packet.durationNs ?? track.defaultDurationNs.flatMap { Int64(exactly: $0) }
         guard let sampleBuffer = try? makeCompressedSampleBuffer(
             data: packet.data, format: formatDescription,
-            ptsNs: packet.ptsNs, durationNs: duration) else {
-            decodeErrorCount += 1
-            return
-        }
+            ptsNs: packet.ptsNs, durationNs: duration) else { return }
         let status = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sampleBuffer,
             flags: [._EnableAsynchronousDecompression],
             frameRefcon: nil, infoFlagsOut: nil)
-        if status != noErr {
-            // Never stall the pipeline on a bad frame: count it and move on.
-            decodeErrorCount += 1
-        }
+        // A rejected frame never stalls the pipeline: VT reports it through the
+        // callback (or not at all) and playback simply continues.
+        _ = status
     }
 
     private func handleDecodedFrame(status: OSStatus, infoFlags: VTDecodeInfoFlags,
                                     imageBuffer: CVImageBuffer?, pts: CMTime, duration: CMTime) {
-        guard status == noErr, let imageBuffer, !infoFlags.contains(.frameDropped) else {
-            if status != noErr { decodeErrorCount += 1 }
-            return
-        }
-        let framePtsNs = pts.isNumeric ? pts.convertScale(1_000_000_000, method: .default).value : 0
+        guard pts.isNumeric else { return }
+        let framePtsNs = pts.convertScale(1_000_000_000, method: .default).value
         let scene = lightLock.withLock { pendingSceneLight.removeValue(forKey: framePtsNs) }
+        guard status == noErr, let imageBuffer, !infoFlags.contains(.frameDropped) else { return }
         let frame = DecodedFrame(
             ptsNs: framePtsNs,
             durationNs: duration.isNumeric ? duration.convertScale(1_000_000_000, method: .default).value : 0,
@@ -518,7 +555,7 @@ final class VideoDecodePipeline {
         reorderLock.unlock()
 
         for f in emit {
-            if f.ptsNs + f.durationNs <= dropBefore { continue }  // seek pre-target frame
+            if f.ptsNs + max(f.durationNs, 1) <= dropBefore { continue }  // seek pre-target frame
             frameQueue.append(f)
         }
     }
@@ -535,7 +572,7 @@ final class VideoDecodePipeline {
         let dropBefore = dropBeforeNsValue
         reorderLock.unlock()
         for f in remaining {
-            if f.ptsNs + f.durationNs <= dropBefore { continue }
+            if f.ptsNs + max(f.durationNs, 1) <= dropBefore { continue }
             frameQueue.append(f)
         }
     }
@@ -605,16 +642,7 @@ final class VideoDecodePipeline {
             let nalType = isHEVC ? Int(bytes[off] >> 1) & 0x3F : Int(bytes[off]) & 0x1F
             let isSEI = isHEVC ? (nalType == 39 || nalType == 40) : (nalType == 6)
             if isSEI, nalLen > headerLen {
-                // De-escape the RBSP (00 00 03 → 00 00) before payload parsing.
-                var rbsp = [UInt8]()
-                rbsp.reserveCapacity(nalLen - headerLen)
-                var zeros = 0
-                for i in (off + headerLen)..<(off + nalLen) {
-                    let b = bytes[i]
-                    if zeros >= 2 && b == 3 { zeros = 0; continue }
-                    zeros = (b == 0) ? zeros + 1 : 0
-                    rbsp.append(b)
-                }
+                let rbsp = deEscapeRBSP(bytes[(off + headerLen)..<(off + nalLen)])
                 var p = 0
                 while p + 1 < rbsp.count, rbsp[p] != 0x80 {
                     var type = 0

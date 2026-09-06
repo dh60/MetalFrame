@@ -140,6 +140,10 @@ final class PlaybackEngine {
     // keeps pulling against the STALE timebase (e.g. ~EOF time) and eats the
     // new run's first frames before the clock snaps back to the seek target.
     private var restarting = false
+    // Seek requests are stamped so a burst (key repeat on the arrow keys)
+    // collapses to the newest: stale restarts are skipped instead of each
+    // paying a thread teardown + priming round.
+    private var seekGeneration = 0
     // After a seek, audio packets ending before this are not fed: the seek
     // cluster can start several seconds before the target, and flooding the
     // renderer with pre-target audio stalls priming (it stops accepting
@@ -186,6 +190,15 @@ final class PlaybackEngine {
         durationSeconds = demuxer.durationSeconds ?? 0
         subtitleCues = Array(repeating: [], count: subtitleTracks.count)
         videoPipeline = try VideoDecodePipeline(track: video)
+        // Output-device change: the OS drops the renderer's queue but keeps
+        // the timebase running. Re-prime from where the clock is now.
+        audioPipeline.onAutomaticFlush = { [weak self] in
+            guard let self else { return }
+            self.controlQueue.async {
+                guard !self.stateLock.withLock({ self.shutdownRequested }) else { return }
+                self.restart(atNs: self.currentTimeNs(), reconfigureAudio: nil)
+            }
+        }
     }
 
     // MARK: - Public control surface
@@ -218,9 +231,19 @@ final class PlaybackEngine {
     }
 
     func seek(toSeconds target: Double, completion: (() -> Void)? = nil) {
-        let clampedNs = Int64(max(0, min(target, durationSeconds)) * 1e9)
+        // A container without a Duration reports 0; only clamp when known.
+        let upper = durationSeconds > 0 ? durationSeconds : Double.infinity
+        let clamped = max(0, min(target.isFinite ? target : 0, upper))
+        let clampedNs = Int64(min(clamped, 9e9) * 1e9)
+        let generation = stateLock.withLock { () -> Int in
+            seekGeneration += 1
+            return seekGeneration
+        }
         controlQueue.async { [self] in
-            restart(atNs: clampedNs, reconfigureAudio: nil)
+            let stale = stateLock.withLock { seekGeneration != generation }
+            if !stale {
+                restart(atNs: clampedNs, reconfigureAudio: nil)
+            }
             if let completion {
                 DispatchQueue.main.async(execute: completion)
             }
@@ -233,6 +256,7 @@ final class PlaybackEngine {
         guard !audioTracks.isEmpty else { return "Audio: None" }
         let (nextIndex, label) = stateLock.withLock { () -> (Int, String) in
             let next = (selectedAudioIndexValue + 1) % audioTracks.count
+            selectedAudioIndexValue = next   // optimistic: the restart below applies it
             return (next, audioTrackLabel(index: next))
         }
         controlQueue.async { [self] in
@@ -261,6 +285,7 @@ final class PlaybackEngine {
             synchronizer.rate = 0
             stopRun()
             audioPipeline.shutdown()
+            videoPipeline.invalidate()
         }
     }
 
@@ -327,7 +352,17 @@ final class PlaybackEngine {
 
     private func applyAudioSelection(index: Int) {
         let track = (index >= 0 && index < audioTracks.count) ? audioTracks[index] : nil
-        if let track, isDecodableAudioCodec(track.codecID), (try? audioPipeline.configure(track: track)) != nil {
+        var configured = false
+        if let track, isDecodableAudioCodec(track.codecID) {
+            do {
+                try audioPipeline.configure(track: track)
+                configured = true
+            } catch {
+                let codec = audioCodecLabel(track.codecID)
+                DispatchQueue.main.async { self.onStatus?("Audio: \(codec) track rejected — playing silent (\(error))") }
+            }
+        }
+        if configured, let track {
             stateLock.withLock {
                 selectedAudioIndexValue = index
                 selectedAudioTrackNumber = track.number
@@ -341,10 +376,13 @@ final class PlaybackEngine {
     }
 
     private func restart(atNs targetNs: Int64, reconfigureAudio: Int?) {
-        let wasPlaying = stateLock.withLock { () -> Bool in
+        // A seek queued behind shutdown() must not resurrect the run.
+        let proceed = stateLock.withLock { () -> Bool in
+            guard !shutdownRequested else { return false }
             restarting = true
-            return desiredPlaying
+            return true
         }
+        guard proceed else { return }
         synchronizer.rate = 0
         stopRun()
         videoPipeline.flush()
@@ -364,14 +402,16 @@ final class PlaybackEngine {
         let preRoll = stateLock.withLock { () -> Int64 in
             let idx = selectedAudioIndexValue
             guard idx >= 0, idx < audioTracks.count else { return 0 }
-            return max(Int64(audioTracks[idx].seekPreRollNs), 0)
+            return max(Int64(clamping: audioTracks[idx].seekPreRollNs), 0)
         }
+        // desiredPlaying is deliberately NOT restored from a snapshot here: a
+        // Space press that landed during the teardown above must win, and
+        // launchRun reads the live value.
         stateLock.withLock {
             demuxEOF = false
             videoDrained = false
             streamEndNs = Int64.max
             endFired = false
-            desiredPlaying = wasPlaying
             audioSkipBeforeNs = targetNs - preRoll
         }
         launchRun(fromNs: targetNs, initialStart: false)
@@ -412,10 +452,22 @@ final class PlaybackEngine {
         // (or audio EOF) before the clock starts — the A/V start alignment.
         let audioActive = stateLock.withLock { selectedAudioTrackNumber != 0 }
         let deadline = Date(timeIntervalSinceNow: 3.0)
+        var reportedAudioError = false
         while Date() < deadline {
-            if run.stopped { return }
+            // shutdown() is waiting on this queue: stop priming immediately
+            // (restarting stays set — the engine is being discarded).
+            if run.stopped || stateLock.withLock({ shutdownRequested }) { return }
             let videoReady = !videoPipeline.frameQueue.isEmpty
+            // A renderer that has errored never accepts data again; don't burn
+            // the full deadline on every seek waiting for it.
+            let audioError = audioPipeline.rendererError
+            if let audioError, !reportedAudioError {
+                reportedAudioError = true
+                let message = "Audio: renderer failed — \(audioError.localizedDescription)"
+                DispatchQueue.main.async { self.onStatus?(message) }
+            }
             let audioReady = !audioActive
+                || audioError != nil
                 || audioPipeline.lastEnqueuedEndNs >= startNs + 200_000_000
                 || audioPipeline.isEOFDrained
             let videoDone = stateLock.withLock { videoDrained }

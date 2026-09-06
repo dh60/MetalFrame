@@ -146,8 +146,8 @@ struct MetalView: View {
         ) { result in
             switch result {
             case .success(let urls):
-                guard let url = urls.first, let view = renderer.view else { return }
-                renderer.setupVideo(url: url, view: view)
+                guard let url = urls.first else { return }
+                renderer.open(url: url)
             case .failure(let error):
                 renderer.errorMessage = "Open failed: \(error.localizedDescription)"
             }
@@ -155,8 +155,7 @@ struct MetalView: View {
         .onOpenURL { url in
             didReceiveURL = true
             isImporting = false
-            guard let view = renderer.view else { return }
-            renderer.setupVideo(url: url, view: view)
+            renderer.open(url: url)
         }
         .onReceive(NotificationCenter.default.publisher(for: .openFileRequested)) { _ in
             isImporting = true
@@ -313,6 +312,13 @@ struct MetalViewRepresentable: NSViewRepresentable {
         view.isPaused = true
         view.enableSetNeedsDisplay = false
         context.coordinator.view = view
+        // A launch-by-document URL can arrive before this view exists; open
+        // it now that it does (deferred so the view is in its window first).
+        if let url = context.coordinator.pendingOpenURL {
+            context.coordinator.pendingOpenURL = nil
+            let renderer = context.coordinator
+            DispatchQueue.main.async { renderer.setupVideo(url: url, view: view) }
+        }
 
         return view
     }
@@ -407,6 +413,15 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     // the frame producer; otherwise the AVPlayer path (MP4/MOV) is.
     var engine: PlaybackEngine?
     var currentSetupTask: Task<Void, Never>?
+    // Bumped per setupVideo; async continuations (AVPlayer metadata loads,
+    // the shader compile) compare against it so a slow load for the previous
+    // file can't write its duration/aspect/fps/tracks into the current one or
+    // start the engine twice.
+    var loadGeneration = 0
+    var pendingOpenURL: URL?
+    // MetalFX scaler build that failed for these (input, output) dimensions;
+    // don't retry every frame until the sizes change.
+    var scalerFailedFor: (Int, Int, Int, Int)?
     var pendingSeekTime: Double?
     var isSeeking = false
     var info = ""
@@ -742,7 +757,10 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     }
 
     func seek(to time: Double) {
-        let clamped = max(0, min(duration, time))
+        // duration is 0 until the AVPlayer path's async load lands (and stays
+        // 0 for containers without one) — only clamp against it when known.
+        let upper = (duration > 0 && duration.isFinite) ? duration : .infinity
+        let clamped = max(0, min(upper, time.isFinite ? time : 0))
         pendingSeekTime = clamped
         isSeeking = true
         lastPulledItemTime = -1
@@ -772,7 +790,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             ?? engine.map { $0.currentTimeSeconds() }
             ?? player?.currentTime().seconds
             ?? 0
-        seek(to: current + seconds)
+        seek(to: (current.isFinite ? current : 0) + seconds)
     }
 
     func togglePlayback() {
@@ -790,18 +808,45 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         }
     }
 
+    // Entry point for every open request; queues the URL if the Metal view
+    // hasn't been created yet (cold launch by document).
+    @MainActor
+    func open(url: URL) {
+        guard let view else {
+            pendingOpenURL = url
+            return
+        }
+        setupVideo(url: url, view: view)
+    }
+
     @MainActor
     func setupVideo(url: URL, view: MTKView) {
         currentSetupTask?.cancel()
         currentSetupTask = nil
+        loadGeneration &+= 1
         errorMessage = nil
         engine?.shutdown()
         engine = nil
         player?.pause()
         player = nil
+        // Detach the previous AVPlayer graph completely: a lingering status
+        // observer would pop the old item's failure over the new file, and the
+        // old item (with its outputs attached) would stay resident all session.
+        if let item = playerItem {
+            if let videoOutput { item.remove(videoOutput) }
+            if let legibleOutput { item.remove(legibleOutput) }
+        }
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = nil
+        if let endObservation { NotificationCenter.default.removeObserver(endObservation) }
+        endObservation = nil
+        playerItem = nil
+        videoOutput = nil
+        legibleOutput = nil
         contentLight = ContentLightInfo()
         currentSceneLight = nil
         tmActive = false
+        resetPlaybackState()
         let ext = url.pathExtension.lowercased()
         if ext == "mkv" || ext == "webm" {
             setupEnginePipeline(url: url, view: view)
@@ -830,6 +875,34 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         }
     }
 
+    // Per-file renderer state, in one place so neither load path can miss a
+    // field (isSeeking and contentFPS used to survive into the next file: a
+    // seek in flight at open time froze the new picture, and a stale fps
+    // re-locked the display link on the next screen change).
+    @MainActor
+    private func resetPlaybackState() {
+        selectedSubtitleIndex = -1
+        subtitleText = ""
+        subtitleOptions = []
+        subtitleGroup = nil
+        audioOptions = []
+        audioGroup = nil
+        selectedAudioIndex = 0
+        currentTime = 0
+        duration = 0
+        pendingSeekTime = nil
+        isSeeking = false
+        contentFPS = nil
+        displayAspect = 0
+        rotationQuadrant = 0
+        rotation = matrix_identity_float2x2
+        measuredFPS = 0
+        fpsFrameCount = 0
+        fpsWindowStart = 0
+        droppedFrames = 0
+        lastPulledItemTime = -1
+    }
+
     // MKV/WebM go through the native engine: our own Matroska demuxer feeding
     // VideoToolbox and AVSampleBufferAudioRenderer. MP4/MOV files AVFoundation
     // can't decode ride the same engine behind an MP4Demuxer passed in by the
@@ -852,46 +925,33 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             return
         }
 
-        selectedSubtitleIndex = -1
-        subtitleText = ""
-        subtitleOptions = []
-        subtitleGroup = nil
-        audioOptions = []
-        audioGroup = nil
-        selectedAudioIndex = 0
-        currentTime = 0
-        pendingSeekTime = nil
-        measuredFPS = 0
-        fpsFrameCount = 0
-        fpsWindowStart = 0
-        droppedFrames = 0
-        lastPulledItemTime = -1
-
         duration = newEngine.durationSeconds
         displayAspect = CGFloat(newEngine.displayAspect ?? 0)
-        rotationQuadrant = 0
-        rotation = matrix_identity_float2x2
         if let fps = newEngine.contentFPS, fps > 0 {
             contentFPS = fps
             ensureDisplayLink(view: view, preferredFPS: fps)
         }
 
-        newEngine.onStatus = { [weak self] message in
-            self?.statusLabel = message
+        // Both callbacks hop to the main queue, so one can land after the
+        // user has already opened the next file — they act only on the
+        // engine they were installed on.
+        newEngine.onStatus = { [weak self, weak newEngine] message in
+            guard let self, let newEngine, self.engine === newEngine else { return }
+            self.statusLabel = message
         }
         // At end of playback, rewind and pause so Space replays from the start
         // (mirrors the AVPlayer end-of-item behavior). Uses the same
         // isSeeking freeze as user seeks so draw() doesn't pull the new run's
         // first frames against the stale end-of-file timebase.
-        newEngine.onEnded = { [weak self] in
-            guard let self else { return }
-            self.engine?.setPlaying(false)
+        newEngine.onEnded = { [weak self, weak newEngine] in
+            guard let self, let newEngine, self.engine === newEngine else { return }
+            newEngine.setPlaying(false)
             self.setPlaybackActivity(false)
             self.isSeeking = true
             self.pendingSeekTime = 0
             self.lastPulledItemTime = -1
-            self.engine?.seek(toSeconds: 0) { [weak self] in
-                guard let self else { return }
+            newEngine.seek(toSeconds: 0) { [weak self, weak newEngine] in
+                guard let self, let newEngine, self.engine === newEngine else { return }
                 if self.pendingSeekTime == 0 {
                     self.pendingSeekTime = nil
                     self.isSeeking = false
@@ -965,25 +1025,16 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
 
         player = AVPlayer(playerItem: playerItem)
 
-        selectedSubtitleIndex = -1
-        subtitleText = ""
-        subtitleOptions = []
-        subtitleGroup = nil
-        audioOptions = []
-        audioGroup = nil
-        selectedAudioIndex = 0
-        currentTime = 0
-        pendingSeekTime = nil
-        measuredFPS = 0
-        fpsFrameCount = 0
-        fpsWindowStart = 0
-        droppedFrames = 0
-        lastPulledItemTime = -1
-
+        // Every write below checks the load generation: these loads can
+        // outlive a quick switch to another file.
+        let generation = loadGeneration
         Task { [weak self] in
             guard let self else { return }
             if let dur = try? await asset.load(.duration) {
-                await MainActor.run { self.duration = CMTimeGetSeconds(dur) }
+                await MainActor.run {
+                    guard self.loadGeneration == generation else { return }
+                    self.duration = CMTimeGetSeconds(dur)
+                }
             }
             // Pull display orientation + frame rate + PAR off the first video track.
             // preferredTransform rotates the encoded frame for display (portrait phone
@@ -1027,7 +1078,10 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                         light.masteringMaxNits = nits
                     }
                     if !light.isEmpty {
-                        await MainActor.run { self.contentLight = light }
+                        await MainActor.run {
+                            guard self.loadGeneration == generation else { return }
+                            self.contentLight = light
+                        }
                     }
                 }
 
@@ -1051,6 +1105,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 let aspect = (quadrant % 2 == 0) ? preRotAspect : 1.0 / preRotAspect
 
                 await MainActor.run {
+                    guard self.loadGeneration == generation else { return }
                     self.rotationQuadrant = quadrant
                     self.rotation = rotMatrix
                     self.displayAspect = aspect
@@ -1066,6 +1121,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             }
             if let group = try? await asset.loadMediaSelectionGroup(for: .legible) {
                 await MainActor.run {
+                    guard self.loadGeneration == generation else { return }
                     self.subtitleGroup = group
                     self.subtitleOptions = group.options
                     self.playerItem?.select(nil, in: group)
@@ -1073,6 +1129,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             }
             if let group = try? await asset.loadMediaSelectionGroup(for: .audible) {
                 await MainActor.run {
+                    guard self.loadGeneration == generation else { return }
                     self.audioGroup = group
                     self.audioOptions = group.options
                     // Start the cycle from whichever track AVPlayer picked by
@@ -1156,9 +1213,14 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
 
         // ewa_lanczossharp kernel LUT (libplacebo). Standard jinc * jinc-window
         // with a mild 0.98125 blur factor and the 3rd jinc zero as support.
+        // libplacebo evaluates the window as window(x / radius * windowRadius),
+        // i.e. the window's own first zero (1.2197 for jinc) lands exactly on
+        // the kernel's support edge; without that factor the window is still
+        // 0.18 at the edge and the outer lobes ring more than the real filter.
         // Precomputed into a 1D LUT indexed by r / maxR ∈ [0, 1].
         let lutSize = 512
         let kernelRadius = 3.2383154841662362
+        let jincWindowRadius = 1.2196698912665045
         let blur = 0.98125058372237073
         let maxR = kernelRadius * blur
         func jinc(_ x: Double) -> Double {
@@ -1172,7 +1234,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             if rPrime >= kernelRadius {
                 lutData[i] = 0
             } else {
-                lutData[i] = Float(jinc(rPrime) * jinc(rPrime / kernelRadius))
+                lutData[i] = Float(jinc(rPrime) * jinc(rPrime / kernelRadius * jincWindowRadius))
             }
         }
         let lutDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: lutSize, height: 1, mipmapped: false)
@@ -1186,7 +1248,6 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             lutTex.replace(region: MTLRegionMake2D(0, 0, lutSize, 1), mipmapLevel: 0, withBytes: bytes.baseAddress!, bytesPerRow: lutSize * MemoryLayout<Float>.size)
         }
         kernelLUT = lutTex
-        argumentTable.setTexture(kernelLUT.gpuResourceID, index: 1)
 
         // Intake uniforms: float3x3 (48) + 3× float2 (24) + float2x2 (16) + 2× float (8) = 96,
         // allocated at 112 for headroom. See IntakeUniforms in shader.
@@ -1231,7 +1292,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             // bilinear blit uses tf to re-encode on output. tmPQ carries the
             // tone-map endpoints as PQ-encoded signal levels (source peak,
             // panel peak); tmPQ.x <= tmPQ.y (or zero) disables tone mapping.
-            struct Uniforms { float2 quadScale; float ratio; float tf; float2 tmPQ; float2 _pad; };
+            struct Uniforms { float2 quadScale; float ratio; float tf; float2 tmPQ; float2 quadOffset; };
 
             // Intake uniforms — columns of float3x3 each padded to float4 stride
             // (48 bytes), then 8/8/8/16/4/4 = 96 bytes total.
@@ -1248,7 +1309,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             vertex VertexOut vertexShader(uint vid [[vertex_id]], constant Uniforms &u [[buffer(0)]]) {
                 float2 positions[6] = { float2(-1,-1), float2(1,-1), float2(-1,1), float2(-1,1), float2(1,-1), float2(1,1) };
                 float2 texCoords[6] = { float2(0,1), float2(1,1), float2(0,0), float2(0,0), float2(1,1), float2(1,0) };
-                return { float4(positions[vid] * u.quadScale, 0, 1), texCoords[vid] };
+                return { float4(positions[vid] * u.quadScale + u.quadOffset, 0, 1), texCoords[vid] };
             }
 
             // Full-coverage triangle for intake — no quad scale, writes to the
@@ -1297,9 +1358,9 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             }
 
             // BT.2100 HLG inverse OETF / OETF. Scene-linear [0,1]. We deliberately
-            // do NOT apply the HLG OOTF — the system OOTF runs at display time per
-            // CAEDRMetadata.h, but since we're not attaching EDRMetadata we leave
-            // values as scene-linear and the panel shows what it can; the rest clips.
+            // do NOT apply the HLG OOTF here: the layer carries CAEDRMetadata.hlg
+            // (see draw()), so the OS applies the system OOTF at display time to
+            // the HLG-encoded values we write back out.
             static inline float3 hlgToLinear(float3 e) {
                 constexpr float a = 0.17883277;
                 constexpr float b = 0.28466892;
@@ -1404,11 +1465,16 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
 
                 // Chroma: fractional position in chroma-pixel units, with siting
                 // offset subtracted so the kernel re-centers on the true chroma
-                // sample grid. 4×4 Mitchell neighborhood — outside-radius taps
-                // get weight 0 from `mitchell(|x|>=2)`.
+                // sample grid. 4×4 Mitchell neighborhood centred on the sample:
+                // floor(c - 0.5) is the nearest tap at or below c, so the window
+                // starts one tap before it (two below, two above — the old
+                // start at floor(c - 0.5) skipped the in-support tap on the low
+                // side and spent one on a zero-weight tap on the high side, a
+                // phase-dependent chroma shift). Outside-radius taps get weight
+                // 0 from `mitchell(|x|>=2)`.
                 float2 cFrac = float2(lx, ly) * 0.5 - u.chromaOffset;
-                int cx0 = int(floor(cFrac.x - 0.5));
-                int cy0 = int(floor(cFrac.y - 0.5));
+                int cx0 = int(floor(cFrac.x - 0.5)) - 1;
+                int cy0 = int(floor(cFrac.y - 0.5)) - 1;
                 float2 cSum = float2(0);
                 float wSum = 0;
                 for (int j = 0; j < 4; ++j) {
@@ -1507,6 +1573,10 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             """
 
         let pixelFormat = view.colorPixelFormat
+        // A compile still running when the next file opens must neither
+        // start that file's engine (a second start() would spawn a second
+        // demux/decode pair) nor report its failure over the new file.
+        let generation = loadGeneration
         Task { [weak self] in
             guard let self else { return }
             let libDesc = MTL4LibraryDescriptor()
@@ -1515,7 +1585,10 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             do {
                 library = try await self.compiler.makeLibrary(descriptor: libDesc)
             } catch {
-                await MainActor.run { self.errorMessage = "Shader compile failed: \(error.localizedDescription)" }
+                await MainActor.run {
+                    guard self.loadGeneration == generation else { return }
+                    self.errorMessage = "Shader compile failed: \(error.localizedDescription)"
+                }
                 return
             }
 
@@ -1538,18 +1611,27 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             }
 
             do {
-                self.renderPipelineIntake  = try await makePipeline(vertexName: "vertexShaderFull",
-                                                                     fragmentName: "fragmentShaderIntake",
-                                                                     colorFormat: .rgba16Float)
-                self.renderPipelineEWA     = try await makePipeline(vertexName: "vertexShader",
-                                                                     fragmentName: "fragmentShaderEWA",
-                                                                     colorFormat: .rgba16Float)
-                self.renderPipelineBilinear = try await makePipeline(vertexName: "vertexShader",
-                                                                      fragmentName: "fragmentShaderBlitEncode",
-                                                                      colorFormat: pixelFormat)
-                await MainActor.run { self.startProducers() }
+                let intake   = try await makePipeline(vertexName: "vertexShaderFull",
+                                                      fragmentName: "fragmentShaderIntake",
+                                                      colorFormat: .rgba16Float)
+                let ewa      = try await makePipeline(vertexName: "vertexShader",
+                                                      fragmentName: "fragmentShaderEWA",
+                                                      colorFormat: .rgba16Float)
+                let bilinear = try await makePipeline(vertexName: "vertexShader",
+                                                      fragmentName: "fragmentShaderBlitEncode",
+                                                      colorFormat: pixelFormat)
+                await MainActor.run {
+                    guard self.loadGeneration == generation else { return }
+                    self.renderPipelineIntake = intake
+                    self.renderPipelineEWA = ewa
+                    self.renderPipelineBilinear = bilinear
+                    self.startProducers()
+                }
             } catch {
-                await MainActor.run { self.errorMessage = "Pipeline state build failed: \(error.localizedDescription)" }
+                await MainActor.run {
+                    guard self.loadGeneration == generation else { return }
+                    self.errorMessage = "Pipeline state build failed: \(error.localizedDescription)"
+                }
             }
         }
     }
@@ -1584,6 +1666,10 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 pulledBuffer = frame.buffer
                 pulledPts = Double(frame.ptsNs) / 1e9
                 if let scene = frame.sceneLight { currentSceneLight = scene }
+                // Static HDR metadata may arrive from the SEI scan a few
+                // frames in; the tone mapper reads it every frame (it used to
+                // be refreshed only while the info overlay was open).
+                contentLight = engine.contentLightInfo
             }
             // Subtitles come from the engine's cue store, keyed by media time.
             if selectedSubtitleIndex >= 0 {
@@ -1605,6 +1691,18 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
 
         if let pixelBuffer = pulledBuffer,
            let attachmentsCF = CVBufferCopyAttachments(pixelBuffer, .shouldPropagate) {
+
+                // The previous frame's command buffer may still be sampling the
+                // textures and reading the intake uniforms replaced below —
+                // Metal 4 command buffers don't retain resources, and dropping
+                // the old CVMetalTexture hands its IOSurface back to the decoder
+                // pool. Serialize on it first. A timed-out wait means the GPU is
+                // wedged: leave everything untouched and try again next tick.
+                if pendingFrameValue > 0,
+                   !frameEvent.wait(untilSignaledValue: pendingFrameValue, timeoutMS: 1000) {
+                    needsRedraw = true
+                    return
+                }
 
                 // Drop detection: consecutive pulled frames should be ~1/fps apart.
                 // A gap well beyond that means intermediate frames were never shown.
@@ -1729,7 +1827,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             : CGFloat(inputTexture.width) / CGFloat(inputTexture.height)
         let viewportAspect = viewportSize.width / viewportSize.height
 
-        let targetSize: CGSize
+        var targetSize: CGSize
         switch scaleMode {
         case .fit:
             targetSize = imageAspect > viewportAspect
@@ -1743,10 +1841,25 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             targetSize = CGSize(width: CGFloat(inputTexture.width), height: CGFloat(inputTexture.height))
         }
 
-        if scaleMode != .off && scaler == nil {
-            let (outputWidth, outputHeight) = (Int(targetSize.width), Int(targetSize.height))
+        // Exactly source-sized output (1080p content on a 1080p panel, say) is
+        // a pixel copy: no scaler, no EWA — the jinc kernel is not
+        // interpolating and would soften a 1:1 image.
+        let isUnity = abs(targetSize.width - CGFloat(inputTexture.width)) < 0.5
+            && abs(targetSize.height - CGFloat(inputTexture.height)) < 0.5
+        if isUnity {
+            targetSize = CGSize(width: CGFloat(inputTexture.width), height: CGFloat(inputTexture.height))
+        }
 
-            if outputWidth > inputTexture.width || outputHeight > inputTexture.height,
+        if scaleMode != .off && !isUnity && scaler == nil {
+            let (outputWidth, outputHeight) = (Int(targetSize.width), Int(targetSize.height))
+            let sizeKey = (inputTexture.width, inputTexture.height, outputWidth, outputHeight)
+
+            // MetalFX is an upscaler: both axes must grow. A mixed case
+            // (anamorphic source fitted into a window that's wider but
+            // shorter) goes to EWA, which handles any ratio. A failed build is
+            // remembered per size so it isn't retried on every frame.
+            if outputWidth > inputTexture.width && outputHeight > inputTexture.height,
+               scalerFailedFor == nil || scalerFailedFor! != sizeKey,
                MTLFXSpatialScalerDescriptor.supportsMetal4FX(device) {
                 let desc = MTLFXSpatialScalerDescriptor()
                 desc.inputWidth = inputTexture.width
@@ -1772,33 +1885,34 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                         scaler = (s, outTex)
                     }
                 }
+                if scaler == nil { scalerFailedFor = sizeKey }
             }
         }
 
         // EWA filter runs whenever we're sampling the source ourselves (i.e. no
-        // MetalFX). At ratio == 1 the kernel collapses to its natural support;
-        // downscale ratios widen it to low-pass at the output Nyquist. Skip when
-        // scaleMode is .off — that path is 1:1 in pixel space and bilinear suffices.
-        let useEWA = scaler == nil && scaleMode != .off
-
-        let scalingMode: String
-        let outputSize: CGSize
-        if scaleMode == .off {
-            scalingMode = "No Scaling"
-            outputSize = CGSize(width: inputTexture.width, height: inputTexture.height)
-        } else if let (_, output) = scaler {
-            let upRatio = Double(output.width) / Double(inputTexture.width)
-            scalingMode = String(format: "Upscaling %.2fx: MetalFX (filter choice ignored)", upRatio)
-            outputSize = CGSize(width: output.width, height: output.height)
-        } else {
-            let downRatio = max(Double(inputTexture.width) / Double(max(targetSize.width, 1)),
-                                Double(inputTexture.height) / Double(max(targetSize.height, 1)))
-            let mode = downRatio < 1.0 ? "Upscaling" : (downRatio > 1.0001 ? "Downscaling" : "1:1")
-            scalingMode = String(format: "%@ %.2fx: ewa_lanczossharp", mode, downRatio)
-            outputSize = targetSize
-        }
+        // MetalFX) and actually resampling. Downscale ratios widen the kernel
+        // to low-pass at the output Nyquist. `.off` and exact 1:1 are pixel
+        // copies through the bilinear blit, placed on integer pixels below.
+        let useEWA = scaler == nil && scaleMode != .off && !isUnity
+        let pixelExact = scaleMode == .off || isUnity
 
         if showInfo {
+            let scalingMode: String
+            let outputSize: CGSize
+            if pixelExact {
+                scalingMode = scaleMode == .off ? "No Scaling" : "1:1: pixel copy"
+                outputSize = CGSize(width: inputTexture.width, height: inputTexture.height)
+            } else if let (_, output) = scaler {
+                let upRatio = Double(output.width) / Double(inputTexture.width)
+                scalingMode = String(format: "Upscaling %.2fx: MetalFX (filter choice ignored)", upRatio)
+                outputSize = CGSize(width: output.width, height: output.height)
+            } else {
+                let downRatio = max(Double(inputTexture.width) / Double(max(targetSize.width, 1)),
+                                    Double(inputTexture.height) / Double(max(targetSize.height, 1)))
+                let mode = downRatio < 1.0 ? "Upscaling" : "Downscaling"
+                scalingMode = String(format: "%@ %.2fx: ewa_lanczossharp", mode, downRatio)
+                outputSize = targetSize
+            }
             // EDR headroom is the multiplier above SDR diffuse white (100 nits per
             // CAEDRMetadata.h opticalOutputScale doc) that the OS is currently
             // letting us push — varies live with the brightness slider on XDR
@@ -1808,7 +1922,6 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             // Content peak sits under panel peak so clipping risk reads at a
             // glance: MaxCLL (brightest pixel in the program) when present,
             // else the mastering display's peak as the grading ceiling.
-            if let engine { contentLight = engine.contentLightInfo }
             let contentLine: String
             if isHDR, contentLight.maxCLL > 0 {
                 let mastered = contentLight.masteringMaxNits > 0
@@ -1848,14 +1961,30 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
 
         // Wait for the previous frame's GPU work before mutating shared per-frame state
         // (allocator memory, uniform buffer contents, argumentTable bindings, residencySet).
-        if pendingFrameValue > 0 {
-            _ = frameEvent.wait(untilSignaledValue: pendingFrameValue, timeoutMS: 1000)
+        // Normally already satisfied by the wait in the pull block above; this
+        // covers needsRedraw-only ticks.
+        if pendingFrameValue > 0,
+           !frameEvent.wait(untilSignaledValue: pendingFrameValue, timeoutMS: 1000) {
+            needsRedraw = true
+            return
         }
 
         // Uniforms: quad scale fits the target inside the drawable; ratio is the
         // radial downscale factor for EWA; linearize toggles sRGB↔linear in the kernel.
         let finalQuadScale = SIMD2<Float>(Float(targetSize.width / viewportSize.width),
                                           Float(targetSize.height / viewportSize.height))
+        // Pixel-exact paths: the centred quad's edge lands on a half pixel
+        // whenever the letterbox margin is odd, and the bilinear blit then
+        // averages neighbouring texels. Nudge by half a pixel so texel centres
+        // sit on pixel centres (half a pixel of placement is invisible; the
+        // blur is not).
+        var quadOffset = SIMD2<Float>(0, 0)
+        if pixelExact {
+            let marginX = Int((viewportSize.width - targetSize.width).rounded())
+            let marginY = Int((viewportSize.height - targetSize.height).rounded())
+            if marginX % 2 != 0 { quadOffset.x = Float(1.0 / viewportSize.width) }
+            if marginY % 2 != 0 { quadOffset.y = Float(1.0 / viewportSize.height) }
+        }
         let ratioEWA: Float = useEWA
             ? Float(max(CGFloat(inputTexture.width) / max(targetSize.width, 1.0),
                         CGFloat(inputTexture.height) / max(targetSize.height, 1.0)))
@@ -1889,8 +2018,8 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             p[3] = tfFlag
             p[4] = tmActive ? Float(pqEncodeNits(sourceNits)) : 0
             p[5] = tmActive ? Float(pqEncodeNits(panelNits)) : 0
-            p[6] = 0
-            p[7] = 0
+            p[6] = quadOffset.x
+            p[7] = quadOffset.y
         }
 
         residencySet.removeAllAllocations()
@@ -1906,6 +2035,13 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         allocator.reset()
         commandBuffer.beginCommandBuffer(allocator: allocator)
         commandBuffer.useResidencySet(residencySet)
+        // Encoder creation failing mid-frame: close the command buffer (never
+        // committed) and ask for a redraw, rather than leaving it open across
+        // the next allocator reset with an unpresented drawable in hand.
+        func abandonFrame() {
+            commandBuffer.endCommandBuffer()
+            needsRedraw = true
+        }
 
         // Pass A — Intake: YUV planes → linear extended RGB at source resolution.
         // The shader does matrix conversion + Mitchell chroma upsample + TF decode
@@ -1920,7 +2056,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             argumentTable.setTexture(cbcrTexture.gpuResourceID, index: 1)
             argumentTable.setAddress(intakeUniformsBuffer.gpuAddress, index: 0)
 
-            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: intakeDesc, options: MTL4RenderEncoderOptions()) else { return }
+            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: intakeDesc, options: MTL4RenderEncoderOptions()) else { abandonFrame(); return }
             encoder.setRenderPipelineState(renderPipelineIntake!)
             encoder.setArgumentTable(argumentTable, stages: [.vertex, .fragment])
             encoder.drawPrimitives(primitiveType: .triangle, vertexStart: 0, vertexCount: 6)
@@ -1947,7 +2083,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             argumentTable.setTexture(kernelLUT.gpuResourceID, index: 1)
             argumentTable.setAddress(uniformsBuffer.gpuAddress, index: 0)
 
-            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, options: MTL4RenderEncoderOptions()) else { return }
+            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, options: MTL4RenderEncoderOptions()) else { abandonFrame(); return }
             encoder.waitForFence(intakeFence, beforeEncoderStages: .fragment)
             encoder.setRenderPipelineState(renderPipelineEWA!)
             encoder.setArgumentTable(argumentTable, stages: [.vertex, .fragment])
@@ -1958,7 +2094,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             argumentTable.setTexture(finalTexture.gpuResourceID, index: 0)
             argumentTable.setAddress(uniformsBuffer.gpuAddress, index: 0)
 
-            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, options: MTL4RenderEncoderOptions()) else { return }
+            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor, options: MTL4RenderEncoderOptions()) else { abandonFrame(); return }
             // Waiting on intakeFence covers both paths: the intake pass updates it,
             // and (when a scaler ran) the MetalFX scaler re-updates it after writing
             // its output — so this one wait orders the blit after whichever produced

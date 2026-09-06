@@ -167,7 +167,7 @@ ffmpeg -y \
     -c:v libx265 -preset slow -crf 18 \
     -pix_fmt yuv420p10le \
     -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
-    -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:hdr-opt=1:repeat-headers=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1600,1600" \
+    -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:hdr-opt=1:repeat-headers=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(16000000,1):max-cll=1600,1600" \
     -tag:v hvc1 \
     -movflags +faststart "$OUTPUT" \
     -hide_banner -loglevel warning

@@ -308,6 +308,7 @@ struct MKVTrack {
     var codecID: String = ""
     var codecPrivate: Data?
     var language: String = "eng"
+    var languageIETF: String?             // LanguageIETF (BCP 47) wins over Language when present
     var name: String?
     var flagDefault: Bool = true          // spec default is 1
     var flagForced: Bool = false
@@ -319,7 +320,7 @@ struct MKVTrack {
     var pixelHeight: Int = 0
     var displayWidth: Int?
     var displayHeight: Int?
-    var displayUnit: Int = 0              // 0 = pixels, 3 = display aspect ratio
+    var displayUnit: Int = 0              // 0 = pixels, 1 = cm, 2 = in, 3 = DAR, 4 = unknown
     var colour: MKVColour?
     // Audio
     var sampleRate: Double = 8000
@@ -329,14 +330,25 @@ struct MKVTrack {
     // ContentEncodings (only the two shapes seen in the wild for tracks)
     var headerStripBytes: Data?           // ContentCompAlgo 3: prepend to every frame
     var zlibCompressed: Bool = false      // ContentCompAlgo 0: zlib per frame
+    var codecPrivateZlib: Bool = false    // ContentCompAlgo 0 with scope bit 2: CodecPrivate is zlib
 
     var effectiveSampleRate: Double { outputSampleRate ?? sampleRate }
 
     // Display aspect ratio for the renderer, folding in PAR / DisplayUnit.
     var displayAspect: Double? {
         guard type == .video, pixelWidth > 0, pixelHeight > 0 else { return nil }
-        if let dw = displayWidth, let dh = displayHeight, dw > 0, dh > 0 {
-            return Double(dw) / Double(dh)  // valid for both pixel and DAR units
+        // Unit 4 = "unknown": the display dimensions carry no information.
+        // Unit 3 = a bare aspect ratio, so both sides are required; the
+        // physical/pixel units default a missing side to the pixel size.
+        if displayUnit != 4, displayWidth != nil || displayHeight != nil {
+            if displayUnit == 3 {
+                if let dw = displayWidth, let dh = displayHeight, dw > 0, dh > 0 {
+                    return Double(dw) / Double(dh)
+                }
+            } else {
+                let dw = displayWidth ?? pixelWidth, dh = displayHeight ?? pixelHeight
+                if dw > 0, dh > 0 { return Double(dw) / Double(dh) }
+            }
         }
         return Double(pixelWidth) / Double(pixelHeight)
     }
@@ -487,11 +499,11 @@ final class MKVDemuxer {
             while reader.position < seekEnd {
                 let (cid, csize) = try readChildHeader()
                 switch cid {
-                case EBML.seekID:
+                case EBML.seekID where csize <= 4:
                     let data = try reader.readBytes(Int(csize))
                     targetID = data.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
                 case EBML.seekPosition:
-                    targetPos = Int64(try readUInt(csize))
+                    targetPos = try readInt64(csize)
                 default:
                     reader.skip(csize)
                 }
@@ -506,7 +518,8 @@ final class MKVDemuxer {
             let (id, size) = try readChildHeader()
             switch id {
             case EBML.timestampScale:
-                timestampScale = try readUInt(size)
+                let scale = try readUInt(size)
+                timestampScale = scale == 0 ? 1_000_000 : scale
             case EBML.duration:
                 durationTicks = try readFloat(size)
             default:
@@ -538,19 +551,27 @@ final class MKVDemuxer {
             case EBML.trackType: t.type = MKVTrackType(raw: try readUInt(size))
             case EBML.flagDefault: t.flagDefault = try readUInt(size) != 0
             case EBML.flagForced: t.flagForced = try readUInt(size) != 0
-            case EBML.defaultDuration: t.defaultDurationNs = try readUInt(size)
+            case EBML.defaultDuration:
+                // 0 means "unknown" and anything past a minute per frame is
+                // garbage; both would otherwise reach a 1e9/x fps derivation.
+                let d = try readUInt(size)
+                t.defaultDurationNs = (d == 0 || d > 60_000_000_000) ? nil : d
             case EBML.language: t.language = try readString(size)
-            case EBML.languageBCP47: t.language = try readString(size)
+            case EBML.languageBCP47: t.languageIETF = try readString(size)
             case EBML.name: t.name = try readString(size)
             case EBML.codecID: t.codecID = try readString(size)
-            case EBML.codecPrivate: t.codecPrivate = try reader.readBytes(Int(size))
-            case EBML.codecDelay: t.codecDelayNs = try readUInt(size)
-            case EBML.seekPreRoll: t.seekPreRollNs = try readUInt(size)
+            case EBML.codecPrivate: t.codecPrivate = try readBlob(size)
+            case EBML.codecDelay: t.codecDelayNs = min(try readUInt(size), UInt64(Int64.max))
+            case EBML.seekPreRoll: t.seekPreRollNs = min(try readUInt(size), UInt64(Int64.max))
             case EBML.video: try parseVideo(end: reader.position + size, into: &t)
             case EBML.audio: try parseAudio(end: reader.position + size, into: &t)
             case EBML.contentEncodings: try parseContentEncodings(end: reader.position + size, into: &t)
             default: reader.skip(size)
             }
+        }
+        if let ietf = t.languageIETF, !ietf.isEmpty { t.language = ietf }
+        if t.codecPrivateZlib, let priv = t.codecPrivate {
+            t.codecPrivate = try Self.zlibInflate(priv)
         }
         return t
     }
@@ -559,11 +580,11 @@ final class MKVDemuxer {
         while reader.position < end {
             let (id, size) = try readChildHeader()
             switch id {
-            case EBML.pixelWidth: t.pixelWidth = Int(try readUInt(size))
-            case EBML.pixelHeight: t.pixelHeight = Int(try readUInt(size))
-            case EBML.displayWidth: t.displayWidth = Int(try readUInt(size))
-            case EBML.displayHeight: t.displayHeight = Int(try readUInt(size))
-            case EBML.displayUnit: t.displayUnit = Int(try readUInt(size))
+            case EBML.pixelWidth: t.pixelWidth = try readInt(size)
+            case EBML.pixelHeight: t.pixelHeight = try readInt(size)
+            case EBML.displayWidth: t.displayWidth = try readInt(size)
+            case EBML.displayHeight: t.displayHeight = try readInt(size)
+            case EBML.displayUnit: t.displayUnit = try readInt(size)
             case EBML.colour: t.colour = try parseColour(end: reader.position + size)
             default: reader.skip(size)
             }
@@ -575,12 +596,12 @@ final class MKVDemuxer {
         while reader.position < end {
             let (id, size) = try readChildHeader()
             switch id {
-            case EBML.matrixCoefficients: c.matrixCoefficients = Int(try readUInt(size))
-            case EBML.primaries: c.primaries = Int(try readUInt(size))
-            case EBML.transferCharacteristics: c.transferCharacteristics = Int(try readUInt(size))
-            case EBML.range: c.range = Int(try readUInt(size))
-            case EBML.maxCLL: c.maxCLL = Int(try readUInt(size))
-            case EBML.maxFALL: c.maxFALL = Int(try readUInt(size))
+            case EBML.matrixCoefficients: c.matrixCoefficients = try readInt(size)
+            case EBML.primaries: c.primaries = try readInt(size)
+            case EBML.transferCharacteristics: c.transferCharacteristics = try readInt(size)
+            case EBML.range: c.range = try readInt(size)
+            case EBML.maxCLL: c.maxCLL = try readInt(size)
+            case EBML.maxFALL: c.maxFALL = try readInt(size)
             case EBML.masteringMetadata: c.mastering = try parseMastering(end: reader.position + size)
             default: reader.skip(size)
             }
@@ -615,8 +636,8 @@ final class MKVDemuxer {
             switch id {
             case EBML.samplingFrequency: t.sampleRate = try readFloat(size)
             case EBML.outputSamplingFrequency: t.outputSampleRate = try readFloat(size)
-            case EBML.channels: t.channels = Int(try readUInt(size))
-            case EBML.bitDepth: t.bitDepth = Int(try readUInt(size))
+            case EBML.channels: t.channels = try readInt(size)
+            case EBML.bitDepth: t.bitDepth = try readInt(size)
             default: reader.skip(size)
             }
         }
@@ -628,19 +649,21 @@ final class MKVDemuxer {
             guard id == EBML.contentEncoding else { reader.skip(size); continue }
             let encEnd = reader.position + size
             var encodingType: UInt64 = 0  // 0 = compression, 1 = encryption
+            var scope: UInt64 = 1         // bit 1 = frames, bit 2 = CodecPrivate
             var compAlgo: UInt64 = 0
             var compSettings: Data?
             while reader.position < encEnd {
                 let (cid, csize) = try readChildHeader()
                 switch cid {
                 case EBML.contentEncodingType: encodingType = try readUInt(csize)
+                case EBML.contentEncodingScope: scope = try readUInt(csize)
                 case EBML.contentCompression:
                     let compEnd = reader.position + csize
                     while reader.position < compEnd {
                         let (kid, ksize) = try readChildHeader()
                         switch kid {
                         case EBML.contentCompAlgo: compAlgo = try readUInt(ksize)
-                        case EBML.contentCompSettings: compSettings = try reader.readBytes(Int(ksize))
+                        case EBML.contentCompSettings: compSettings = try readBlob(ksize)
                         default: reader.skip(ksize)
                         }
                     }
@@ -651,8 +674,12 @@ final class MKVDemuxer {
                 throw MKVError.corrupt("encrypted track \(t.number) unsupported")
             }
             switch compAlgo {
-            case 0: t.zlibCompressed = true
-            case 3: t.headerStripBytes = compSettings ?? Data()
+            case 0:
+                if scope & 1 != 0 { t.zlibCompressed = true }
+                if scope & 2 != 0 { t.codecPrivateZlib = true }
+            case 3:
+                // Header stripping only makes sense for frames.
+                if scope & 1 != 0 { t.headerStripBytes = compSettings ?? Data() }
             default:
                 throw MKVError.corrupt("track \(t.number) uses unsupported compression algo \(compAlgo)")
             }
@@ -670,7 +697,7 @@ final class MKVDemuxer {
                 let (cid, csize) = try readChildHeader()
                 switch cid {
                 case EBML.cueTime:
-                    timeTicks = Int64(try readUInt(csize))
+                    timeTicks = try readInt64(csize)
                 case EBML.cueTrackPositions:
                     let posEnd = reader.position + csize
                     while reader.position < posEnd {
@@ -679,7 +706,7 @@ final class MKVDemuxer {
                         case EBML.cueClusterPosition:
                             // Keep the FIRST track's position per point — video
                             // cues carry the keyframe clusters.
-                            if clusterPos < 0 { clusterPos = Int64(try readUInt(ksize)) }
+                            if clusterPos < 0 { clusterPos = try readInt64(ksize) }
                             else { reader.skip(ksize) }
                         default: reader.skip(ksize)
                         }
@@ -689,8 +716,10 @@ final class MKVDemuxer {
                 }
             }
             if timeTicks >= 0, clusterPos >= 0 {
-                cuePoints.append((timeNs: timeTicks * Int64(timestampScale),
-                                  clusterOffset: segmentDataStart + clusterPos))
+                let (timeNs, overflow) = timeTicks.multipliedReportingOverflow(by: Int64(clamping: timestampScale))
+                if !overflow {
+                    cuePoints.append((timeNs: timeNs, clusterOffset: segmentDataStart + clusterPos))
+                }
             }
         }
         cuePoints.sort { $0.timeNs < $1.timeNs }
@@ -726,7 +755,7 @@ final class MKVDemuxer {
                 }
                 switch id {
                 case EBML.clusterTimestamp:
-                    clusterTimestampTicks = Int64(try readUInt(size))
+                    clusterTimestampTicks = try readInt64(size)
                 case EBML.simpleBlock:
                     if let packet = try parseBlock(size: size, simple: true,
                                                    blockDurationTicks: nil,
@@ -777,7 +806,7 @@ final class MKVDemuxer {
                 blockRange = (reader.position, size)
                 reader.skip(size)
             case EBML.blockDuration:
-                durationTicks = Int64(try readUInt(size))
+                durationTicks = try readInt64(size)
             case EBML.referenceBlock:
                 hasReference = true
                 reader.skip(size)
@@ -804,6 +833,11 @@ final class MKVDemuxer {
                             discardPaddingNs: Int64) throws -> MKVPacket? {
         let blockEnd = reader.position + size
         let (trackNumber, trackVarintLen) = try reader.readVarint()
+        // A block too short for its own header is damage, not EOF: skip it.
+        guard size >= Int64(trackVarintLen) + 3 else {
+            reader.seek(to: blockEnd)
+            return nil
+        }
         let tsHi = try reader.readByte()
         let tsLo = try reader.readByte()
         let relTicks = Int64(Int16(bitPattern: (UInt16(tsHi) << 8) | UInt16(tsLo)))
@@ -817,8 +851,12 @@ final class MKVDemuxer {
 
         let keyframe = simple ? (flags & 0x80) != 0 : !hasReference
         let lacing = (flags >> 1) & 0x03
-        let ptsTicks = clusterTimestampTicks + relTicks
-        let ptsNs = ptsTicks * Int64(timestampScale)
+        let scale = Int64(clamping: timestampScale)
+        let (ptsTicks, addOverflow) = clusterTimestampTicks.addingReportingOverflow(relTicks)
+        let (ptsNs, mulOverflow) = ptsTicks.multipliedReportingOverflow(by: scale)
+        guard !addOverflow, !mulOverflow else {
+            throw MKVError.corrupt("timestamp overflow at \(reader.position)")
+        }
 
         var frameSizes: [Int] = []
         if lacing == 0 {
@@ -875,24 +913,27 @@ final class MKVDemuxer {
 
         // Per-frame duration: BlockDuration split over the lace, DefaultDuration,
         // or codec-derived (needed for laced audio without DefaultDuration).
-        let defaultFrameDurNs: Int64? = track.defaultDurationNs.map(Int64.init)
-        let blockDurNs: Int64? = blockDurationTicks.map { $0 * Int64(timestampScale) }
+        let defaultFrameDurNs: Int64? = track.defaultDurationNs.flatMap { Int64(exactly: $0) }
+        let blockDurNs: Int64? = blockDurationTicks.flatMap {
+            let (v, overflow) = $0.multipliedReportingOverflow(by: scale)
+            return overflow ? nil : v
+        }
 
         var packets: [MKVPacket] = []
         var frameOffsetNs: Int64 = 0
         for (i, frameSize) in frameSizes.enumerated() {
             var data = try reader.readBytes(frameSize)
-            if let strip = track.headerStripBytes, !strip.isEmpty {
-                data = strip + data
-            }
             if track.zlibCompressed {
                 data = try Self.zlibInflate(data)
             }
+            if let strip = track.headerStripBytes, !strip.isEmpty {
+                data = strip + data
+            }
             var frameDurNs: Int64?
-            if let d = defaultFrameDurNs {
-                frameDurNs = d
-            } else if let bd = blockDurNs {
+            if let bd = blockDurNs {
                 frameDurNs = bd / Int64(frameSizes.count)
+            } else if let d = defaultFrameDurNs {
+                frameDurNs = d
             } else if frameSizes.count > 1 || track.type == .audio {
                 frameDurNs = Self.codecFrameDurationNs(codecID: track.codecID,
                                                        data: data,
@@ -915,9 +956,9 @@ final class MKVDemuxer {
 
     // MARK: Seeking
 
-    // Repositions the cluster cursor at the keyframe cluster ≤ target (via Cues)
-    // or the first cluster when the file has none (linear fallback — correct,
-    // just slow for big files). Returns the cue time landed on, for diagnostics.
+    // Repositions the cluster cursor at the keyframe cluster ≤ target (via Cues),
+    // or, when the file has none, at the last cluster whose timestamp is ≤ target
+    // found by walking cluster headers. Returns the time landed on.
     @discardableResult
     func seek(toNs target: Int64) -> Int64 {
         pendingPackets.removeAll()
@@ -926,8 +967,7 @@ final class MKVDemuxer {
         clusterTimestampTicks = 0
 
         guard !cuePoints.isEmpty else {
-            reader.seek(to: firstClusterOffset)
-            return 0
+            return seekByClusterScan(toNs: target)
         }
         // Last cue point with time ≤ target (binary search).
         var lo = 0, hi = cuePoints.count - 1, best = 0
@@ -942,6 +982,38 @@ final class MKVDemuxer {
         }
         reader.seek(to: cuePoints[best].clusterOffset)
         return cuePoints[best].timeNs
+    }
+
+    // No Cues: hop from cluster header to cluster header (one small read each)
+    // keeping the last one at or before the target. Landing on a cluster
+    // start is what a cue would give us too — frame accuracy is the decoder's
+    // dropBefore logic either way. An unknown-size cluster can't be hopped
+    // over, so the scan stops there and playback resumes from it.
+    private func seekByClusterScan(toNs target: Int64) -> Int64 {
+        var landing = (offset: firstClusterOffset, timeNs: Int64(0))
+        var pos = firstClusterOffset
+        let scale = Int64(clamping: timestampScale)
+        while pos < segmentEnd {
+            reader.seek(to: pos)
+            guard let id = try? reader.readElementID() else { break }
+            let sizeOrUnknown: Int64?          // nil = unknown-size element
+            do { sizeOrUnknown = try reader.readElementSize() } catch { break }
+            if id != EBML.cluster {
+                guard let size = sizeOrUnknown else { break }
+                pos = reader.position + size
+                continue
+            }
+            let dataStart = reader.position
+            guard let child = try? readChildHeader(), child.0 == EBML.clusterTimestamp,
+                  let ticks = try? readInt64(child.1) else { break }
+            let (timeNs, overflow) = ticks.multipliedReportingOverflow(by: scale)
+            if overflow || timeNs > target { break }
+            landing = (pos, timeNs)
+            guard let size = sizeOrUnknown else { break }
+            pos = dataStart + size
+        }
+        reader.seek(to: landing.offset)
+        return landing.timeNs
     }
 
     // MARK: Element helpers
@@ -966,6 +1038,24 @@ final class MKVDemuxer {
         return data.reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
     }
 
+    // EBML uints are up to 64 bits; the values we fold into signed math are
+    // clamped rather than trapped on (a plain Int64(UInt64.max) aborts the app).
+    private func readInt64(_ size: Int64) throws -> Int64 {
+        Int64(clamping: try readUInt(size))
+    }
+
+    private func readInt(_ size: Int64) throws -> Int {
+        Int(clamping: try readUInt(size))
+    }
+
+    // Metadata payloads (CodecPrivate, compression settings): bound the
+    // allocation so a corrupt size can't ask for gigabytes.
+    private static let maxBlobBytes: Int64 = 16 << 20
+    private func readBlob(_ size: Int64) throws -> Data {
+        guard size <= Self.maxBlobBytes else { throw MKVError.corrupt("metadata element of \(size) bytes") }
+        return try reader.readBytes(Int(size))
+    }
+
     private func readSInt(_ size: Int64) throws -> Int64 {
         guard size >= 1, size <= 8 else { return 0 }
         let data = try reader.readBytes(Int(size))
@@ -977,6 +1067,7 @@ final class MKVDemuxer {
     }
 
     private func readFloat(_ size: Int64) throws -> Double {
+        guard size == 4 || size == 8 else { throw MKVError.corrupt("float size \(size)") }
         let data = try reader.readBytes(Int(size))
         switch data.count {
         case 4:
@@ -991,7 +1082,7 @@ final class MKVDemuxer {
     }
 
     private func readString(_ size: Int64) throws -> String {
-        let data = try reader.readBytes(Int(size))
+        let data = try readBlob(size)
         // Strings may be zero-padded per EBML.
         let trimmed = data.prefix { $0 != 0 }
         return String(data: trimmed, encoding: .utf8) ?? ""
@@ -1060,8 +1151,10 @@ final class MKVDemuxer {
     static func zlibInflate(_ data: Data) throws -> Data {
         guard data.count > 6 else { throw MKVError.corrupt("zlib frame too short") }
         let deflate = data.subdata(in: (data.startIndex + 2)..<(data.endIndex - 4))
+        // Grow a few times for an exactly-full output; a payload that never
+        // fits is corrupt, not merely big (8 rounds would reach a gigabyte).
         var capacity = max(data.count * 8, 1 << 16)
-        for _ in 0..<8 {
+        for _ in 0..<4 {
             var out = Data(count: capacity)
             let written = out.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) -> Int in
                 deflate.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> Int in
