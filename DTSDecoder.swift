@@ -41,7 +41,6 @@ struct DTSDecodedFrame {
 private struct BitReader {
     let bytes: [UInt8]
     var bitPos: Int = 0
-    var bitsLeft: Int { bytes.count * 8 - bitPos }
 
     mutating func bit() throws -> UInt32 {
         guard bitPos < bytes.count * 8 else { throw DTSError.corrupt("out of bits") }
@@ -464,7 +463,10 @@ final class DTSDecoder {
             // Joint intensity coding scale factors (absolute, biased by 64).
             var joinScales = Array(repeating: [Double](repeating: 0, count: Self.numSubbands), count: nCh)
             var joinShuff = [Int](repeating: 0, count: nCh)
-            for ch in 0..<nCh where joinX[ch] > 0 { joinShuff[ch] = Int(try br.bits(3)) }
+            for ch in 0..<nCh where joinX[ch] > 0 {
+                joinShuff[ch] = Int(try br.bits(3))
+                guard joinShuff[ch] != 7 else { throw DTSError.corrupt("JOIN_HUFF") }
+            }
             for ch in 0..<nCh where joinX[ch] > 0 {
                 let src = joinX[ch] - 1
                 guard src < nCh, nSubs[src] >= nSubs[ch] else { throw DTSError.corrupt("JOINX") }
@@ -504,7 +506,8 @@ final class DTSDecoder {
                 let count = 2 * h.lfeFlag * nSSC
                 var raw = [Double](repeating: 0, count: count)
                 for i in 0..<count { raw[i] = Double(try br.sbits(8)) }
-                let scaleIdx = min(Int(try br.bits(8)), DTSTables.scaleFactorQuant7.count - 1)
+                let scaleIdx = Int(try br.bits(8))
+                guard scaleIdx < DTSTables.scaleFactorQuant7.count else { throw DTSError.corrupt("LFE scale") }
                 let scale = DTSTables.scaleFactorQuant7[scaleIdx] * 0.035
                 for i in 0..<count { lfeSamples.append(raw[i] * scale) }
             }
@@ -595,12 +598,15 @@ final class DTSDecoder {
             frameSampleBase += subframeSamples
         }
 
-        // Update ADPCM history with the final reconstructed samples of every band.
+        // Update ADPCM history with the final reconstructed samples of every
+        // band — the last samples actually decoded (frameSampleBase), which is
+        // the buffer tail for a full frame but not for a short one.
+        let decoded = min(frameSampleBase, subbandLen)
         for ch in 0..<nCh {
             for n in 0..<Self.numSubbands {
                 let base = n * subbandLen
                 for k in 0..<4 {
-                    adpcmHistory[ch][n * 4 + k] = subbandLen > k ? subband[ch][base + subbandLen - 1 - k] : 0
+                    adpcmHistory[ch][n * 4 + k] = decoded > k ? subband[ch][base + decoded - 1 - k] : 0
                 }
             }
         }
@@ -646,12 +652,15 @@ final class DTSDecoder {
             }
         }
         var pcm = [Float](repeating: 0, count: outCh * pcmPerChannel)
+        func clampSample(_ v: Double) -> Float {
+            v.isFinite ? Float(max(-1.0, min(1.0, v))) : 0
+        }
         for slot in 0..<outCh {
             let src = order[slot]
             if src == -1 {
-                for i in 0..<pcmPerChannel { pcm[i * outCh + slot] = Float(lfePCM[i] * lfeGain) }
+                for i in 0..<pcmPerChannel { pcm[i * outCh + slot] = clampSample(lfePCM[i] * lfeGain) }
             } else {
-                for i in 0..<pcmPerChannel { pcm[i * outCh + slot] = Float(chPCM[src][i] * outputGain) }
+                for i in 0..<pcmPerChannel { pcm[i * outCh + slot] = clampSample(chPCM[src][i] * outputGain) }
             }
         }
         return DTSDecodedFrame(sampleRate: h.sampleRate, channelCount: outCh,

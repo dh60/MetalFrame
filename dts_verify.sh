@@ -60,11 +60,15 @@ encode s5144        src_6_44100.wav 754500
 fail=0
 for v in mono48:1 stereo48hi:2 stereo48lo:2 stereo48ad:2 s5148hi:6 s5148lo:6 s5148ad:6 s5144:6; do
     name=${v%:*}; ch=${v#*:}
-    "$WORK/dtsdec" "$WORK/$name.dts" "$WORK/$name.out" 2>/dev/null
+    "$WORK/dtsdec" "$WORK/$name.dts" "$WORK/$name.out"
     python3 - "$WORK/$name.ref" "$WORK/$name.out" "$ch" "$name" <<'PYEOF' || fail=1
 import math, struct, sys
 ref = open(sys.argv[1], "rb").read(); test = open(sys.argv[2], "rb").read()
 ch = int(sys.argv[3]); name = sys.argv[4]
+# A decoder that silently drops frames must not pass on the prefix it did emit.
+if abs(len(ref) - len(test)) > len(ref) // 100:
+    print(f"{name}: output length {len(test)} vs reference {len(ref)}  FAIL")
+    sys.exit(1)
 n = min(len(ref), len(test)) // 4
 r = struct.unpack(f"<{n}f", ref[:n*4]); t = struct.unpack(f"<{n}f", test[:n*4])
 worst = 1e99

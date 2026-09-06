@@ -45,7 +45,7 @@ func audioCodecLabel(_ codecID: String) -> String {
     }
 }
 
-private func parseAudioSpecificConfig(_ asc: Data) -> (sampleRate: Double, channels: Int)? {
+private func parseAudioSpecificConfig(_ asc: Data) -> (sampleRate: Double, channels: Int?)? {
     guard asc.count >= 2 else { return nil }
     let b = [UInt8](asc)
     var bitPos = 0
@@ -70,15 +70,17 @@ private func parseAudioSpecificConfig(_ asc: Data) -> (sampleRate: Double, chann
         let extIdx = bits(4)
         rate = extIdx == 15 ? Double(bits(24)) : rates[extIdx]
     }
-    let channels = chanConfig == 7 ? 8 : chanConfig
+    // channelConfiguration 0 = a program_config_element carries the layout;
+    // nil lets the caller keep the container's channel count.
+    let channels: Int? = chanConfig == 0 ? nil : (chanConfig == 7 ? 8 : chanConfig)
     guard rate > 0 else { return nil }
-    return (rate, max(1, channels))
+    return (rate, channels)
 }
 
 func makeAudioFormatDescription(track: MKVTrack) throws -> CMAudioFormatDescription {
     var asbd = AudioStreamBasicDescription()
     asbd.mSampleRate = track.effectiveSampleRate
-    asbd.mChannelsPerFrame = UInt32(track.channels)
+    asbd.mChannelsPerFrame = UInt32(clamping: max(track.channels, 1))
     var cookie: Data?
 
     switch track.codecID {
@@ -93,7 +95,7 @@ func makeAudioFormatDescription(track: MKVTrack) throws -> CMAudioFormatDescript
         asbd.mFramesPerPacket = 1024
         if let asc = track.codecPrivate, let cfg = parseAudioSpecificConfig(asc) {
             asbd.mSampleRate = cfg.sampleRate
-            asbd.mChannelsPerFrame = UInt32(cfg.channels)
+            if let ch = cfg.channels { asbd.mChannelsPerFrame = UInt32(ch) }
         }
         cookie = track.codecPrivate  // raw AudioSpecificConfig
     case "A_FLAC":
@@ -152,11 +154,18 @@ func makeAudioFormatDescription(track: MKVTrack) throws -> CMAudioFormatDescript
 }
 
 // Split an MKV block that carries several AC-3 / E-AC-3 syncframes into
-// individual packets (CoreAudio expects one syncframe per packet). Frame sizes
-// come from the headers, not from scanning for sync words.
+// individual packets (CoreAudio expects one access unit per packet). Frame
+// sizes come from the headers, not from scanning for sync words. An E-AC-3
+// dependent substream (strmtyp 1 — the extra channels of 7.1 / some Atmos
+// streams) is not decodable on its own: it stays glued to the independent
+// syncframe it extends.
 func splitDolbySyncframes(codecID: String, data: Data) -> [Data] {
     let bytes = [UInt8](data)
     guard bytes.count > 6, bytes[0] == 0x0B, bytes[1] == 0x77 else { return [data] }
+
+    func isDependent(at off: Int) -> Bool {
+        codecID == "A_EAC3" && off + 2 < bytes.count && (bytes[off + 2] >> 6) == 1
+    }
 
     func frameSize(at off: Int) -> Int? {
         guard off + 6 <= bytes.count, bytes[off] == 0x0B, bytes[off + 1] == 0x77 else { return nil }
@@ -182,15 +191,24 @@ func splitDolbySyncframes(codecID: String, data: Data) -> [Data] {
     guard let first = frameSize(at: 0), first < bytes.count else { return [data] }
     var out: [Data] = []
     var off = 0
+    var pieceStart = 0
     while off < bytes.count {
         guard let size = frameSize(at: off), size > 0, off + size <= bytes.count else {
             // Header didn't parse — keep the remainder as one packet rather
             // than dropping audio.
-            out.append(data.subdata(in: (data.startIndex + off)..<data.endIndex))
             break
         }
-        out.append(data.subdata(in: (data.startIndex + off)..<(data.startIndex + off + size)))
-        off += size
+        let next = off + size
+        // Close the piece unless the following syncframe is a dependent
+        // substream that belongs to it.
+        if next >= bytes.count || !isDependent(at: next) {
+            out.append(data.subdata(in: (data.startIndex + pieceStart)..<(data.startIndex + next)))
+            pieceStart = next
+        }
+        off = next
+    }
+    if pieceStart < bytes.count {
+        out.append(data.subdata(in: (data.startIndex + pieceStart)..<data.endIndex))
     }
     return out.isEmpty ? [data] : out
 }
@@ -218,8 +236,18 @@ final class AudioPipeline {
     // TrimDurationAtStart for codec delay (Opus pre-skip) and seek alignment.
     private var pendingStartTrimNs: Int64 = 0
     private var firstBufferPending = true
-    private(set) var lastEnqueuedEndNs: Int64 = Int64.min
+    private var lastEnqueuedEndNsValue: Int64 = Int64.min
+    var lastEnqueuedEndNs: Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastEnqueuedEndNsValue
+    }
     var rendererError: Error? { renderer.error }
+    // Fired (on the pump queue) when the OS flushed the renderer on its own —
+    // an output-device change — and everything queued is gone. The engine
+    // re-primes from the current time.
+    var onAutomaticFlush: (() -> Void)?
+    private var autoFlushObserver: NSObjectProtocol?
 
     private var repumpScheduled = false
 
@@ -235,6 +263,16 @@ final class AudioPipeline {
         renderer.requestMediaDataWhenReady(on: pumpQueue) { [weak self] in
             self?.pump()
         }
+        autoFlushObserver = NotificationCenter.default.addObserver(
+            forName: .AVSampleBufferAudioRendererWasFlushedAutomatically,
+            object: renderer, queue: nil
+        ) { [weak self] _ in
+            self?.onAutomaticFlush?()
+        }
+    }
+
+    deinit {
+        if let autoFlushObserver { NotificationCenter.default.removeObserver(autoFlushObserver) }
     }
 
     // Select the track this pipeline feeds.
@@ -250,7 +288,7 @@ final class AudioPipeline {
         eof = false
         firstBufferPending = true
         pendingStartTrimNs = Int64(track.codecDelayNs)
-        lastEnqueuedEndNs = Int64.min
+        lastEnqueuedEndNsValue = Int64.min
         lock.unlock()
     }
 
@@ -299,7 +337,7 @@ final class AudioPipeline {
         dtsDecoder?.reset()   // safe: pump drained above, and closed blocks new work
         lock.lock()
         firstBufferPending = false
-        lastEnqueuedEndNs = Int64.min
+        lastEnqueuedEndNsValue = Int64.min
         lock.unlock()
     }
 
@@ -375,7 +413,7 @@ final class AudioPipeline {
                 }
                 renderer.enqueue(sb)
                 lock.lock()
-                lastEnqueuedEndNs = max(lastEnqueuedEndNs, ptsNs + (pieceDurNs ?? 0))
+                lastEnqueuedEndNsValue = max(lastEnqueuedEndNsValue, ptsNs + (pieceDurNs ?? 0))
                 lock.unlock()
             }
         }
@@ -484,7 +522,7 @@ final class AudioPipeline {
             }
             renderer.enqueue(sb)
             lock.lock()
-            lastEnqueuedEndNs = max(lastEnqueuedEndNs, ptsNs + durNs)
+            lastEnqueuedEndNsValue = max(lastEnqueuedEndNsValue, ptsNs + durNs)
             lock.unlock()
         }
     }
@@ -495,7 +533,7 @@ final class AudioPipeline {
     // blocked on a full FIFO (no push-kicks), feeding would deadlock.
     private func scheduleRepumpIfNeeded() {
         lock.lock()
-        let pending = !closed && !fifo.isEmpty && format != nil
+        let pending = !closed && !fifo.isEmpty && track != nil
         let shouldSchedule = pending && !repumpScheduled
         if shouldSchedule { repumpScheduled = true }
         lock.unlock()

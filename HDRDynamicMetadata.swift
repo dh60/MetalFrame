@@ -191,6 +191,11 @@ func parseDolbyVisionRPU(rpu: [UInt8]) -> SceneLightInfo? {
           let rpuFormat = r.read(11),
           r.skip(4 + 4),                                     // vdr_rpu_profile, vdr_rpu_level
           let seqInfoPresent = r.read(1) else { return nil }
+    // Without the sequence header every later field width is a guess (the
+    // spec lets an RPU inherit it from a previous one). Bail rather than
+    // parse garbage: the renderer keeps the last scene stats, which is the
+    // carry-forward the stream intended.
+    guard seqInfoPresent == 1 else { return nil }
     var coefficientDataType: UInt32 = 0
     var coefficientLog2Denom: UInt32 = 23
     var blBitDepth = 10
@@ -232,12 +237,13 @@ func parseDolbyVisionRPU(rpu: [UInt8]) -> SceneLightInfo? {
             guard r.skip(numPivots[c] * blBitDepth) else { return nil }
         }
         if rpuFormat & 0x700 == 0 && !disableResidual {
-            // Profile 7 dual-layer NLQ pivots (3 pivots at BL depth + method).
+            // Profile 7 dual-layer NLQ: method_type (3) + 2 pivots at BL depth.
             guard r.skip(3), r.skip(2 * blBitDepth) else { return nil }
         }
         guard r.readUE() != nil,                             // num_x_partitions_minus1
               r.readUE() != nil else { return nil }          // num_y_partitions_minus1
-        let coefBits = Int(coefficientLog2Denom)
+        // coefficient_data_type 1 = 32-bit floats; only type 0 uses log2_denom.
+        let coefBits = coefficientDataType == 0 ? Int(coefficientLog2Denom) : 32
         for c in 0..<3 {
             for _ in 0..<(numPivots[c] - 1) {
                 guard let mappingIdc = r.readUE() else { return nil }
