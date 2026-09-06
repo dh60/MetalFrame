@@ -74,20 +74,22 @@ struct MetalView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             if renderer.selectedSubtitleIndex >= 0 && !renderer.subtitleText.isEmpty {
-                VStack {
-                    Spacer()
-                    Text(renderer.subtitleText)
-                        .font(.system(size: 36, weight: .medium, design: .serif))
-                        .tracking(1.2)
-                        .foregroundStyle(.white)
-                        .shadow(color: .black, radius: 0, x: 1.5, y: 1.5)
-                        .shadow(color: .black, radius: 1, x: 0, y: 0)
-                        .shadow(color: .black.opacity(0.4), radius: 3, x: 0, y: 1)
-                        .padding(.horizontal, 40)
-                        .padding(.bottom, 60)
-                        .multilineTextAlignment(.center)
+                GeometryReader { geo in
+                    VStack {
+                        Spacer()
+                        Text(renderer.subtitleText)
+                            .font(.system(size: 36, weight: .medium, design: .serif))
+                            .tracking(1.2)
+                            .foregroundStyle(.white)
+                            .shadow(color: .black, radius: 0, x: 1.5, y: 1.5)
+                            .shadow(color: .black, radius: 1, x: 0, y: 0)
+                            .shadow(color: .black.opacity(0.4), radius: 3, x: 0, y: 1)
+                            .padding(.horizontal, 40)
+                            .padding(.bottom, 60 + geo.size.height * 0.05)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(maxWidth: .infinity)
             }
             if renderer.showInfo {
                 VStack(alignment: .leading) {
@@ -424,6 +426,9 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     var errorMessage: String?
     var subtitleOptions: [AVMediaSelectionOption] = []
     var subtitleGroup: AVMediaSelectionGroup?
+    var audioOptions: [AVMediaSelectionOption] = []
+    var audioGroup: AVMediaSelectionGroup?
+    var selectedAudioIndex = 0
     var legibleOutput: AVPlayerItemLegibleOutput?
     var didSetColorSpace = false
     var scalerColorMode: MTLFXSpatialScalerColorProcessingMode = .perceptual
@@ -705,11 +710,22 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     }
 
     func cycleAudio() {
-        guard let engine else {
-            statusLabel = "Audio: track switching is MKV-only for now"
+        if let engine {
+            statusLabel = engine.cycleAudioTrack()
             return
         }
-        statusLabel = engine.cycleAudioTrack()
+        guard let group = audioGroup, !audioOptions.isEmpty else {
+            statusLabel = "Audio: None Available"
+            return
+        }
+        selectedAudioIndex = (selectedAudioIndex + 1) % audioOptions.count
+        let option = audioOptions[selectedAudioIndex]
+        playerItem?.select(option, in: group)
+        if audioOptions.count > 1 {
+            statusLabel = "Audio \(selectedAudioIndex + 1)/\(audioOptions.count): \(option.displayName)"
+        } else {
+            statusLabel = "Audio: \(option.displayName)"
+        }
     }
 
     func seek(to time: Double) {
@@ -827,6 +843,9 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         subtitleText = ""
         subtitleOptions = []
         subtitleGroup = nil
+        audioOptions = []
+        audioGroup = nil
+        selectedAudioIndex = 0
         currentTime = 0
         pendingSeekTime = nil
         measuredFPS = 0
@@ -937,6 +956,9 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         subtitleText = ""
         subtitleOptions = []
         subtitleGroup = nil
+        audioOptions = []
+        audioGroup = nil
+        selectedAudioIndex = 0
         currentTime = 0
         pendingSeekTime = nil
         measuredFPS = 0
@@ -1034,6 +1056,20 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                     self.subtitleGroup = group
                     self.subtitleOptions = group.options
                     self.playerItem?.select(nil, in: group)
+                }
+            }
+            if let group = try? await asset.loadMediaSelectionGroup(for: .audible) {
+                await MainActor.run {
+                    self.audioGroup = group
+                    self.audioOptions = group.options
+                    // Start the cycle from whichever track AVPlayer picked by
+                    // default (system language preference), so the first 'a'
+                    // press moves to a different language, not back onto it.
+                    if let item = self.playerItem,
+                       let current = item.currentMediaSelection.selectedMediaOption(in: group),
+                       let idx = group.options.firstIndex(of: current) {
+                        self.selectedAudioIndex = idx
+                    }
                 }
             }
         }
