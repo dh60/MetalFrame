@@ -2,8 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Version stamped into Info.plist; CI passes the release version, local builds default to 1.0
-VERSION="${VERSION:-1.0}"
+# Version stamped into Info.plist; CI can override it for release builds.
+VERSION="${VERSION:-0.3.0}"
 
 # Clean build
 rm -rf MetalFrame.app
@@ -13,6 +13,7 @@ mkdir -p MetalFrame.app/Contents/MacOS
 
 # Compile the Swift code + link (optimized — swiftc defaults to -Onone)
 swiftc metalframe.swift \
+    Playlist.swift \
     MKVDemuxer.swift \
     MP4Demuxer.swift \
     HDRDynamicMetadata.swift \
@@ -60,6 +61,8 @@ cat << EOF > MetalFrame.app/Contents/Info.plist
                 <string>public.mpeg-4</string>
                 <string>public.movie</string>
                 <string>org.matroska.mkv</string>
+                <string>org.matroska.webm</string>
+                <string>com.dh60.metalframe.playlist</string>
             </array>
         </dict>
     </array>
@@ -69,6 +72,36 @@ cat << EOF > MetalFrame.app/Contents/Info.plist
          declares Matroska. -->
     <key>UTImportedTypeDeclarations</key>
     <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.dh60.metalframe.playlist</string>
+            <key>UTTypeDescription</key>
+            <string>M3U Playlist</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.text</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>m3u</string><string>m3u8</string></array>
+                <key>public.mime-type</key>
+                <array><string>audio/x-mpegurl</string></array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.matroska.webm</string>
+            <key>UTTypeDescription</key>
+            <string>WebM Video</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.movie</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>webm</string></array>
+                <key>public.mime-type</key>
+                <array><string>video/webm</string></array>
+            </dict>
+        </dict>
         <dict>
             <key>UTTypeIdentifier</key>
             <string>org.matroska.mkv</string>
