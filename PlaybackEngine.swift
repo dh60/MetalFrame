@@ -175,6 +175,10 @@ final class PlaybackEngine {
 
     var selectedAudioIndex: Int { stateLock.withLock { selectedAudioIndexValue } }
     var isPlaying: Bool { synchronizer.rate > 0 }
+    var volume: Float {
+        get { audioPipeline.volume }
+        set { audioPipeline.volume = newValue }
+    }
 
     init(demuxer: any MediaDemuxer) throws {
         self.demuxer = demuxer
@@ -402,7 +406,11 @@ final class PlaybackEngine {
         let preRoll = stateLock.withLock { () -> Int64 in
             let idx = selectedAudioIndexValue
             guard idx >= 0, idx < audioTracks.count else { return 0 }
-            return max(Int64(clamping: audioTracks[idx].seekPreRollNs), 0)
+            let track = audioTracks[idx]
+            // DTS core prediction and synthesis history need warming after
+            // reset even when the container does not declare SeekPreRoll.
+            let decoderPreRoll: Int64 = track.codecID == "A_DTS" ? 100_000_000 : 0
+            return max(Int64(clamping: track.seekPreRollNs), decoderPreRoll)
         }
         // desiredPlaying is deliberately NOT restored from a snapshot here: a
         // Space press that landed during the teardown above must win, and
@@ -452,6 +460,10 @@ final class PlaybackEngine {
         // (or audio EOF) before the clock starts — the A/V start alignment.
         let audioActive = stateLock.withLock { selectedAudioTrackNumber != 0 }
         let deadline = Date(timeIntervalSinceNow: 3.0)
+        // Initial startup keeps a deeper audio cushion. After a seek, a short
+        // cushion is enough to avoid waiting on 200 ms of audio before the
+        // playhead can move again.
+        let audioPrimeNs: Int64 = initialStart ? 200_000_000 : 40_000_000
         var reportedAudioError = false
         while Date() < deadline {
             // shutdown() is waiting on this queue: stop priming immediately
@@ -468,7 +480,7 @@ final class PlaybackEngine {
             }
             let audioReady = !audioActive
                 || audioError != nil
-                || audioPipeline.lastEnqueuedEndNs >= startNs + 200_000_000
+                || audioPipeline.lastEnqueuedEndNs >= startNs + audioPrimeNs
                 || audioPipeline.isEOFDrained
             let videoDone = stateLock.withLock { videoDrained }
             if (videoReady || videoDone) && audioReady { break }
@@ -485,7 +497,18 @@ final class PlaybackEngine {
         if let firstPts = videoPipeline.frameQueue.firstPtsNs, firstPts > startNs {
             clockStartNs = firstPts
         }
+        // setRate updates the timebase asynchronously. Keep the seek in flight
+        // until the time jump is applied, so its completion cannot expose the
+        // old clock to the progress bar or resume pulling against stale time.
+        let timeJump = DispatchSemaphore(value: 0)
+        let observer = NotificationCenter.default.addObserver(
+            forName: NSNotification.Name(kCMTimebaseNotification_TimeJumped as String),
+            object: synchronizer.timebase, queue: nil
+        ) { _ in timeJump.signal() }
+        let needsJump = currentTimeNs() != clockStartNs
         synchronizer.setRate(playing ? 1 : 0, time: CMTime(value: clockStartNs, timescale: 1_000_000_000))
+        if needsJump { _ = timeJump.wait(timeout: .now() + 0.5) }
+        NotificationCenter.default.removeObserver(observer)
         stateLock.withLock { restarting = false }
     }
 

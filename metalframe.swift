@@ -11,13 +11,18 @@ import simd
 
 extension Notification.Name {
     static let openFileRequested = Notification.Name("MetalFrame.openFileRequested")
+    static let openFolderRequested = Notification.Name("MetalFrame.openFolderRequested")
+    static let addFilesRequested = Notification.Name("MetalFrame.addFilesRequested")
 }
 
 @main
 struct MetalFrame: App {
+    @State private var renderer = Renderer()
+
     var body: some Scene {
+        @Bindable var playlist = renderer.playlist
         Window("MetalFrame", id: "main") {
-            MetalView()
+            MetalView(renderer: renderer)
         }
         .commands {
             CommandGroup(replacing: .newItem) {
@@ -25,19 +30,53 @@ struct MetalFrame: App {
                     NotificationCenter.default.post(name: .openFileRequested, object: nil)
                 }
                 .keyboardShortcut("o")
+                Button("Open Folder…") {
+                    NotificationCenter.default.post(name: .openFolderRequested, object: nil)
+                }
+                .keyboardShortcut("o", modifiers: [.command, .shift])
+                Button("Add to Playlist…") {
+                    NotificationCenter.default.post(name: .addFilesRequested, object: nil)
+                }
+                .keyboardShortcut("o", modifiers: [.command, .option])
+                Button("Save Playlist…") { renderer.savePlaylist() }
+                    .disabled(playlist.files.isEmpty)
+            }
+            CommandMenu("Playback") {
+                Button("Previous File") { renderer.previousFile() }
+                    .keyboardShortcut("q", modifiers: [])
+                    .disabled(!playlist.canGoPrevious)
+                Button("Next File") { renderer.nextFile() }
+                    .keyboardShortcut("w", modifiers: [])
+                    .disabled(!playlist.canGoNext)
+                Divider()
+                Picker("Loop", selection: $playlist.loopMode) {
+                    ForEach(LoopMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+                Toggle("Shuffle", isOn: $playlist.shuffle)
+                Button("Show Playlist") { renderer.showPlaylist.toggle() }
+                    .keyboardShortcut("p", modifiers: [])
             }
         }
     }
 }
 
 struct MetalView: View {
-    @State private var renderer = Renderer()
+    @State var renderer: Renderer
     @State private var mouseHideTimer: Timer?
     @State private var showProgressBar = false
     @State private var showStatusOverlay = false
     @State private var statusTimer: Timer?
     @State private var isImporting = false
     @State private var didReceiveURL = false
+    @State private var importFolder = false
+    @State private var appendFiles = false
+
+    private var importTypes: [UTType] {
+        if importFolder { return [.folder] }
+        return [.movie, .folder] + ["mkv", "webm", "m3u", "m3u8"].compactMap {
+            UTType(filenameExtension: $0)
+        }
+    }
 
     func flashStatusOverlay() {
         withAnimation { showStatusOverlay = true }
@@ -54,6 +93,9 @@ struct MetalView: View {
             if renderer.duration > 0 {
                 VStack {
                     Spacer()
+                    PlaylistControls(renderer: renderer)
+                        .opacity(showProgressBar || renderer.showPlaylist ? 1 : 0)
+                        .allowsHitTesting(showProgressBar || renderer.showPlaylist)
                     ProgressBar(currentTime: $renderer.currentTime, duration: renderer.duration, onSeek: { time in
                         renderer.seek(to: time)
                     }, isVisible: $showProgressBar)
@@ -94,16 +136,19 @@ struct MetalView: View {
             if renderer.showInfo {
                 VStack(alignment: .leading) {
                     Text(renderer.info)
-                    Picker("Scale", selection: $renderer.scaleMode) {
-                        ForEach(ScaleMode.allCases, id: \.self) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
+                    ScaleModePicker(selection: $renderer.scaleMode)
                 }
                 .padding()
                 .glassEffect(in: .rect(cornerRadius: 30))
                 .padding()
+            }
+            if renderer.showPlaylist {
+                HStack {
+                    Spacer()
+                    PlaylistPanel(renderer: renderer)
+                        .frame(width: 340, height: 420)
+                        .padding()
+                }
             }
             if let error = renderer.errorMessage {
                 VStack {
@@ -127,6 +172,7 @@ struct MetalView: View {
                 showProgressBar = true
                 mouseHideTimer?.invalidate()
                 mouseHideTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { _ in
+                    guard !renderer.showPlaylist else { return }
                     NSCursor.hide()
                     showProgressBar = false
                 }
@@ -138,16 +184,12 @@ struct MetalView: View {
         }
         .fileImporter(
             isPresented: $isImporting,
-            // .movie covers registered formats; MKV only conforms to public.movie
-            // when some installed app declares it, so also pass our imported UTI
-            // (declared in Info.plist) to keep .mkv selectable on clean systems.
-            allowedContentTypes: [.movie] + (UTType("org.matroska.mkv").map { [$0] } ?? []),
-            allowsMultipleSelection: false
+            allowedContentTypes: importTypes,
+            allowsMultipleSelection: !importFolder
         ) { result in
             switch result {
             case .success(let urls):
-                guard let url = urls.first else { return }
-                renderer.open(url: url)
+                renderer.loadPlaylist(urls: urls, appending: appendFiles)
             case .failure(let error):
                 renderer.errorMessage = "Open failed: \(error.localizedDescription)"
             }
@@ -158,6 +200,18 @@ struct MetalView: View {
             renderer.open(url: url)
         }
         .onReceive(NotificationCenter.default.publisher(for: .openFileRequested)) { _ in
+            importFolder = false
+            appendFiles = false
+            isImporting = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openFolderRequested)) { _ in
+            importFolder = true
+            appendFiles = false
+            isImporting = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .addFilesRequested)) { _ in
+            importFolder = false
+            appendFiles = true
             isImporting = true
         }
         .task {
@@ -171,8 +225,14 @@ struct MetalView: View {
         .focusEffectDisabled()
         .onMoveCommand { direction in
             switch direction {
-            case .left, .up: renderer.seek(by: -10)
-            case .right, .down: renderer.seek(by: 10)
+            case .left: renderer.seek(by: -10)
+            case .right: renderer.seek(by: 10)
+            case .up:
+                renderer.adjustVolume(by: 10)
+                flashStatusOverlay()
+            case .down:
+                renderer.adjustVolume(by: -10)
+                flashStatusOverlay()
             default: break
             }
         }
@@ -217,6 +277,144 @@ struct MetalView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { _ in
             NSApp.presentationOptions = []
         }
+    }
+}
+
+struct ScaleModePicker: View {
+    @Binding var selection: ScaleMode
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(ScaleMode.allCases, id: \.self) { mode in
+                Button { selection = mode } label: {
+                    Text(mode.rawValue)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .foregroundStyle(selection == mode ? Color.white : .primary)
+                        .background(selection == mode ? Color.purple : .clear,
+                                    in: RoundedRectangle(cornerRadius: 6))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Scale: \(mode.rawValue)")
+                .accessibilityAddTraits(selection == mode ? .isSelected : [])
+            }
+        }
+        .padding(3)
+        .background(.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+struct PlaylistControls: View {
+    let renderer: Renderer
+
+    var body: some View {
+        @Bindable var playlist = renderer.playlist
+        HStack(spacing: 16) {
+            Button { renderer.previousFile() } label: {
+                Image(systemName: "backward.end.fill")
+            }
+            .disabled(!playlist.canGoPrevious)
+            .help("Previous file (Q)")
+            Button { renderer.nextFile() } label: {
+                Image(systemName: "forward.end.fill")
+            }
+            .disabled(!playlist.canGoNext)
+            .help("Next file (W)")
+            Picker("Loop", selection: $playlist.loopMode) {
+                ForEach(LoopMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            }
+            .fixedSize()
+            .help("Repeat the current file or the whole playlist")
+            Button { playlist.shuffle.toggle() } label: {
+                Image(systemName: "shuffle")
+                    .foregroundStyle(playlist.shuffle ? Color.accentColor : .primary)
+            }
+            .help(playlist.shuffle ? "Shuffle on" : "Shuffle off")
+            Button { renderer.showPlaylist.toggle() } label: {
+                Label("\((playlist.currentIndex ?? 0) + 1) / \(playlist.files.count)",
+                      systemImage: "list.bullet")
+            }
+            .help("Show playlist (P)")
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .glassEffect(in: .capsule)
+    }
+}
+
+struct PlaylistPanel: View {
+    let renderer: Renderer
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Playlist · \(renderer.playlist.files.count)").font(.headline)
+                Spacer()
+                Button { renderer.showPlaylist = false } label: {
+                    Image(systemName: "xmark")
+                }
+                .help("Close playlist")
+            }
+            HStack {
+                Button("Add…") {
+                    NotificationCenter.default.post(name: .addFilesRequested, object: nil)
+                }
+                Button("Folder…") {
+                    NotificationCenter.default.post(name: .openFolderRequested, object: nil)
+                }
+                Button("Save…") { renderer.savePlaylist() }
+                    .disabled(renderer.playlist.files.isEmpty)
+            }
+            if renderer.playlist.files.isEmpty {
+                Text("Open videos or a folder to build a playlist.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 4) {
+                            ForEach(renderer.playlist.files, id: \.self) { url in
+                                HStack {
+                                    Button { renderer.playFile(url) } label: {
+                                        HStack {
+                                            Image(systemName: renderer.playlist.currentURL == url
+                                                  ? "play.fill" : "film")
+                                            Text(url.lastPathComponent)
+                                                .lineLimit(2)
+                                                .multilineTextAlignment(.leading)
+                                            Spacer(minLength: 0)
+                                        }
+                                        .contentShape(Rectangle())
+                                    }
+                                    .help(url.path)
+                                    Button { renderer.removeFile(url) } label: {
+                                        Image(systemName: "minus.circle")
+                                    }
+                                    .help("Remove from playlist")
+                                }
+                                .buttonStyle(.plain)
+                                .padding(8)
+                                .background(renderer.playlist.currentURL == url
+                                            ? Color.accentColor.opacity(0.2) : .clear,
+                                            in: RoundedRectangle(cornerRadius: 8))
+                                .id(url)
+                            }
+                        }
+                    }
+                    .onChange(of: renderer.playlist.currentURL, initial: true) {
+                        if let url = renderer.playlist.currentURL { proxy.scrollTo(url) }
+                    }
+                }
+            }
+            Text("Q Previous · W Next · P Playlist")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(16)
+        .glassEffect(in: .rect(cornerRadius: 20))
     }
 }
 
@@ -346,6 +544,12 @@ enum TransferFunction: Int32 {
 
 @Observable
 class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate {
+    let playlist = Playlist()
+    var showPlaylist = false
+    private var playlistLoadGeneration = 0
+    private var playlistLoadTask: Task<Void, Never>?
+    private var accessedURLs: [URL] = []
+    private var failedPlaylistFiles = Set<URL>()
     var device: MTLDevice!
     var queue: MTL4CommandQueue!
     var renderPipelineIntake: MTLRenderPipelineState?
@@ -423,6 +627,8 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     // don't retry every frame until the sizes change.
     var scalerFailedFor: (Int, Int, Int, Int)?
     var pendingSeekTime: Double?
+    private var seekRequestGeneration = 0
+    private var seekDisplayFloor: Double?
     var isSeeking = false
     var info = ""
     var showInfo = false
@@ -437,6 +643,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     var colorspaceLabel = "sRGB"
     var subtitleText = ""
     var statusLabel = ""
+    private(set) var volumePercent = 100
     var selectedSubtitleIndex = -1
     var errorMessage: String?
     var subtitleOptions: [AVMediaSelectionOption] = []
@@ -495,12 +702,14 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     }
 
     deinit {
+        playlistLoadTask?.cancel()
         currentSetupTask?.cancel()
         engine?.shutdown()
         displayLink?.invalidate()
         if let screenObservation { NotificationCenter.default.removeObserver(screenObservation) }
         if let endObservation { NotificationCenter.default.removeObserver(endObservation) }
         if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        for url in accessedURLs { url.stopAccessingSecurityScopedResource() }
     }
 
     // Hold the idle-sleep assertion only while actually playing — a paused player
@@ -762,11 +971,17 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         let upper = (duration > 0 && duration.isFinite) ? duration : .infinity
         let clamped = max(0, min(upper, time.isFinite ? time : 0))
         pendingSeekTime = clamped
+        currentTime = clamped
+        seekDisplayFloor = clamped
         isSeeking = true
         lastPulledItemTime = -1
+        let generation = loadGeneration
+        seekRequestGeneration &+= 1
+        let request = seekRequestGeneration
         if let engine {
             engine.seek(toSeconds: clamped) { [weak self] in
-                guard let self else { return }
+                guard let self, self.loadGeneration == generation,
+                      self.seekRequestGeneration == request else { return }
                 if self.pendingSeekTime == clamped {
                     self.pendingSeekTime = nil
                     self.isSeeking = false
@@ -777,20 +992,46 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         }
         let target = CMTime(seconds: clamped, preferredTimescale: 600)
         player?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-            guard let self else { return }
-            if self.pendingSeekTime == clamped {
-                self.pendingSeekTime = nil
-                self.isSeeking = false
+            Task { @MainActor in
+                guard let self, self.loadGeneration == generation,
+                      self.seekRequestGeneration == request else { return }
+                if self.pendingSeekTime == clamped {
+                    self.pendingSeekTime = nil
+                    self.isSeeking = false
+                    self.currentTime = clamped
+                }
             }
         }
     }
 
     func seek(by seconds: Double) {
         let current = pendingSeekTime
+            ?? seekDisplayFloor
             ?? engine.map { $0.currentTimeSeconds() }
             ?? player?.currentTime().seconds
             ?? 0
         seek(to: (current.isFinite ? current : 0) + seconds)
+    }
+
+    private func updatePlaybackTime(_ now: Double) {
+        guard !isSeeking, now.isFinite else { return }
+        // The audio device's presentation latency can briefly put the new
+        // clock just before the requested position, even after the time jump.
+        // Hold the requested display time until playback reaches it.
+        if let floor = seekDisplayFloor {
+            guard now >= floor else { return }
+            seekDisplayFloor = nil
+        }
+        if abs(now - currentTime) >= 0.1 { currentTime = now }
+    }
+
+    @MainActor
+    func adjustVolume(by percentage: Int) {
+        volumePercent = max(0, min(100, volumePercent + percentage))
+        let volume = Float(volumePercent) / 100
+        engine?.volume = volume
+        player?.volume = volume
+        statusLabel = "Volume: \(volumePercent)%"
     }
 
     func togglePlayback() {
@@ -808,10 +1049,103 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         }
     }
 
-    // Entry point for every open request; queues the URL if the Metal view
-    // hasn't been created yet (cold launch by document).
     @MainActor
     func open(url: URL) {
+        loadPlaylist(urls: [url])
+    }
+
+    @MainActor
+    func loadPlaylist(urls: [URL], appending: Bool = false) {
+        playlistLoadTask?.cancel()
+        playlistLoadGeneration &+= 1
+        let generation = playlistLoadGeneration
+        for url in urls where !accessedURLs.contains(url) {
+            if url.startAccessingSecurityScopedResource() { accessedURLs.append(url) }
+        }
+        playlistLoadTask = Task { @MainActor [weak self] in
+            do {
+                let files = try await Task.detached {
+                    try PlaylistFiles.expand(urls)
+                }.value
+                guard let self, !Task.isCancelled,
+                      self.playlistLoadGeneration == generation else { return }
+                guard !files.isEmpty else {
+                    self.errorMessage = "No video files found in the selection."
+                    return
+                }
+                let wasEmpty = self.playlist.files.isEmpty
+                if appending { self.playlist.append(files) }
+                else { self.playlist.replace(with: files) }
+                self.failedPlaylistFiles.removeAll()
+                self.showPlaylist = self.playlist.files.count > 1
+                if !appending || wasEmpty, let url = self.playlist.currentURL {
+                    self.openPlaylistFile(url)
+                }
+            } catch {
+                guard let self, !Task.isCancelled,
+                      self.playlistLoadGeneration == generation else { return }
+                self.errorMessage = "Open failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    @MainActor
+    func savePlaylist() {
+        guard !playlist.files.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.title = "Save Playlist"
+        panel.nameFieldStringValue = "Playlist.m3u8"
+        panel.allowedContentTypes = [UTType(filenameExtension: "m3u8") ?? .plainText]
+        panel.begin { [weak self] response in
+            guard response == .OK, let destination = panel.url, let self else { return }
+            do {
+                try PlaylistFiles.save(self.playlist.files, to: destination)
+            } catch {
+                self.errorMessage = "Save failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    @MainActor
+    func previousFile() {
+        guard let url = playlist.previous() else { return }
+        failedPlaylistFiles.removeAll()
+        openPlaylistFile(url)
+    }
+
+    @MainActor
+    func nextFile() {
+        guard let url = playlist.next() else { return }
+        failedPlaylistFiles.removeAll()
+        openPlaylistFile(url)
+    }
+
+    @MainActor
+    func playFile(_ url: URL) {
+        guard playlist.files.contains(url) else { return }
+        playlist.select(url)
+        failedPlaylistFiles.removeAll()
+        openPlaylistFile(url)
+    }
+
+    @MainActor
+    func removeFile(_ url: URL) {
+        let wasCurrent = playlist.currentURL == url
+        playlist.remove(url)
+        guard wasCurrent else { return }
+        failedPlaylistFiles.removeAll()
+        if let next = playlist.currentURL { openPlaylistFile(next) }
+        else {
+            pendingOpenURL = nil
+            tearDownPlayback()
+        }
+    }
+
+    // Keep the playlist intact while switching producers. Cold launches defer
+    // only this file's setup until the Metal view exists.
+    @MainActor
+    private func openPlaylistFile(_ url: URL) {
+        statusLabel = "\((playlist.currentIndex ?? 0) + 1)/\(playlist.files.count): \(url.lastPathComponent)"
         guard let view else {
             pendingOpenURL = url
             return
@@ -820,7 +1154,84 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     }
 
     @MainActor
+    private func playbackEnded() {
+        failedPlaylistFiles.removeAll()
+        let previous = playlist.currentURL
+        if let next = playlist.next(automatic: true) {
+            // Seeking an existing producer avoids rebuilding Metal resources on
+            // every current-file loop (including a one-file playlist loop).
+            if next == previous {
+                restartCurrentFile(playing: true)
+            } else {
+                openPlaylistFile(next)
+            }
+        } else {
+            restartCurrentFile(playing: false)
+        }
+    }
+
+    @MainActor
+    private func restartCurrentFile(playing: Bool) {
+        if let engine {
+            engine.setPlaying(playing)
+        } else if let player {
+            if playing { player.play() } else { player.pause() }
+        }
+        setPlaybackActivity(playing)
+        seek(to: 0)
+        currentTime = 0
+    }
+
+    @MainActor
+    private func fileFailed(_ message: String) {
+        errorMessage = message
+        setPlaybackActivity(false)
+        guard let current = playlist.currentURL else { return }
+        failedPlaylistFiles.insert(current)
+        // A bad file in a folder must not prevent the remaining videos from
+        // playing. Ignore current-file looping here and stop after one full
+        // unsuccessful pass, even when playlist looping is enabled.
+        if let next = playlist.next() {
+            guard !failedPlaylistFiles.contains(next) else {
+                playlist.select(current)
+                return
+            }
+            let generation = loadGeneration
+            statusLabel = "Skipped \(current.lastPathComponent): \(message)"
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.loadGeneration == generation,
+                      self.playlist.currentURL == next else { return }
+                self.openPlaylistFile(next)
+            }
+        }
+    }
+
+    @MainActor
     func setupVideo(url: URL, view: MTKView) {
+        tearDownPlayback()
+        let ext = url.pathExtension.lowercased()
+        if ext == "mkv" || ext == "webm" {
+            setupEnginePipeline(url: url, view: view)
+        } else {
+            currentSetupTask = Task { @MainActor [weak self] in
+                let asset = AVURLAsset(url: url)
+                var avfDecodable = true
+                if let vTrack = try? await asset.loadTracks(withMediaType: .video).first {
+                    avfDecodable = (try? await vTrack.load(.isDecodable)) ?? true
+                }
+                guard let self, !Task.isCancelled else { return }
+                if !avfDecodable, let demuxer = try? await MP4Demuxer(asset: asset) {
+                    guard !Task.isCancelled else { return }
+                    self.setupEnginePipeline(url: url, view: view, demuxer: demuxer)
+                } else {
+                    self.setupVideoPipeline(url: url, view: view)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func tearDownPlayback() {
         currentSetupTask?.cancel()
         currentSetupTask = nil
         loadGeneration &+= 1
@@ -847,32 +1258,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         currentSceneLight = nil
         tmActive = false
         resetPlaybackState()
-        let ext = url.pathExtension.lowercased()
-        if ext == "mkv" || ext == "webm" {
-            setupEnginePipeline(url: url, view: view)
-        } else {
-            // MP4/MOV: AVPlayer, unless AVFoundation refuses to decode the
-            // video track. WEB-DLs tagged 'hev1' (in-band parameter sets
-            // allowed) are demuxable but not decodable by AVPlayer, while
-            // VideoToolbox decodes the same stream fine once the format
-            // description is built from the hvcC sample entry — those route
-            // through the engine via the AVAssetReader-backed demuxer.
-            currentSetupTask = Task { @MainActor [weak self] in
-                let asset = AVURLAsset(url: url)
-                var avfDecodable = true
-                if let vTrack = try? await asset.loadTracks(withMediaType: .video).first {
-                    avfDecodable = (try? await vTrack.load(.isDecodable)) ?? true
-                }
-                guard let self, !Task.isCancelled else { return }
-                if !avfDecodable, let demuxer = try? await MP4Demuxer(asset: asset) {
-                    self.setupEnginePipeline(url: url, view: view, demuxer: demuxer)
-                } else {
-                    // Decodable normally — or broken in a way the engine can't
-                    // rescue either, and then AVPlayer surfaces the error.
-                    self.setupVideoPipeline(url: url, view: view)
-                }
-            }
-        }
+        setPlaybackActivity(false)
     }
 
     // Per-file renderer state, in one place so neither load path can miss a
@@ -891,6 +1277,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         currentTime = 0
         duration = 0
         pendingSeekTime = nil
+        seekDisplayFloor = nil
         isSeeking = false
         contentFPS = nil
         displayAspect = 0
@@ -915,10 +1302,11 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         do {
             newEngine = try PlaybackEngine(demuxer: demuxer ?? MKVDemuxer(url: url))
         } catch {
-            errorMessage = "Cannot play this file: \(error)"
+            fileFailed("Cannot play this file: \(error)")
             return
         }
         engine = newEngine
+        newEngine.volume = Float(volumePercent) / 100
         setupMetalCore(view: view)
         guard errorMessage == nil else {
             engine = nil
@@ -939,25 +1327,9 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             guard let self, let newEngine, self.engine === newEngine else { return }
             self.statusLabel = message
         }
-        // At end of playback, rewind and pause so Space replays from the start
-        // (mirrors the AVPlayer end-of-item behavior). Uses the same
-        // isSeeking freeze as user seeks so draw() doesn't pull the new run's
-        // first frames against the stale end-of-file timebase.
         newEngine.onEnded = { [weak self, weak newEngine] in
             guard let self, let newEngine, self.engine === newEngine else { return }
-            newEngine.setPlaying(false)
-            self.setPlaybackActivity(false)
-            self.isSeeking = true
-            self.pendingSeekTime = 0
-            self.lastPulledItemTime = -1
-            newEngine.seek(toSeconds: 0) { [weak self, weak newEngine] in
-                guard let self, let newEngine, self.engine === newEngine else { return }
-                if self.pendingSeekTime == 0 {
-                    self.pendingSeekTime = nil
-                    self.isSeeking = false
-                }
-                self.currentTime = 0
-            }
+            self.playbackEnded()
         }
     }
 
@@ -978,24 +1350,23 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         itemStatusObservation = playerItem?.observe(\.status, options: [.new]) { [weak self] item, _ in
             guard let self, item.status == .failed else { return }
             let msg = item.error?.localizedDescription ?? "Unknown decode error"
-            Task { @MainActor in self.errorMessage = "Cannot play this file: \(msg)" }
+            Task { @MainActor in
+                guard self.playerItem === item else { return }
+                self.fileFailed("Cannot play this file: \(msg)")
+            }
         }
 
-        // At end of playback, rewind and pause so Space replays from the start
-        // (and the idle-sleep assertion is released while we sit on the end frame).
         if let endObservation { NotificationCenter.default.removeObserver(endObservation) }
         endObservation = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: playerItem,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
             guard let self else { return }
             MainActor.assumeIsolated {
-                self.player?.pause()
-                self.player?.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
-                self.currentTime = 0
-                self.lastPulledItemTime = -1
-                self.setPlaybackActivity(false)
+                guard let item = notification.object as? AVPlayerItem,
+                      self.playerItem === item else { return }
+                self.playbackEnded()
             }
         }
 
@@ -1024,6 +1395,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         playerItem?.add(newLegibleOutput)
 
         player = AVPlayer(playerItem: playerItem)
+        player?.volume = Float(volumePercent) / 100
 
         // Every write below checks the load generation: these loads can
         // outlive a quick switch to another file.
@@ -1661,7 +2033,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         if let engine {
             let mediaNs = engine.mediaTimeNs(forHostSeconds: pullHostTime)
             let now = engine.currentTimeSeconds()
-            if abs(now - currentTime) >= 0.1 { currentTime = now }
+            updatePlaybackTime(now)
             if !isSeeking, let frame = engine.pullFrame(atMediaTimeNs: mediaNs) {
                 pulledBuffer = frame.buffer
                 pulledPts = Double(frame.ptsNs) / 1e9
@@ -1679,7 +2051,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         } else if let output = videoOutput, let item = playerItem {
             let time = output.itemTime(forHostTime: pullHostTime)
             let now = item.currentTime().seconds
-            if abs(now - currentTime) >= 0.1 { currentTime = now }
+            updatePlaybackTime(now)
             var displayTime = CMTime.invalid
             if !isSeeking,
                output.hasNewPixelBuffer(forItemTime: time),

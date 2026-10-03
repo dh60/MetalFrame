@@ -361,6 +361,9 @@ struct MKVPacket {
     let keyframe: Bool
     let discardPaddingNs: Int64 // Opus end-trim (last packet), 0 otherwise
     let data: Data
+    // Container timestamps are quantized; decoded PCM must keep sample timing
+    // within this rounding window rather than reproduce gaps at block edges.
+    var timestampResolutionNs: Int64 = 1
 }
 
 // MARK: - Demuxer
@@ -378,7 +381,7 @@ final class MKVDemuxer {
     private var segmentDataStart: Int64 = 0
     private var segmentEnd: Int64                        // file end if unknown
     private var firstClusterOffset: Int64 = 0
-    private var cuePoints: [(timeNs: Int64, clusterOffset: Int64)] = []
+    private var cuePoints: [(timeNs: Int64, clusterOffset: Int64, trackNumber: UInt64)] = []
     private var tracksByNumber: [UInt64: MKVTrack] = [:]
 
     // Cluster streaming state.
@@ -395,6 +398,12 @@ final class MKVDemuxer {
         guard tracks.contains(where: { $0.type == .video || $0.type == .audio }) else {
             throw MKVError.corrupt("no playable tracks found")
         }
+        // Subtitle/audio cues can be more frequent than video keyframes. They
+        // cannot restart video decoding, even when they share a video cluster.
+        let seekTrack = tracks.first(where: { $0.type == .video })
+            ?? tracks.first(where: { $0.type == .audio })
+        cuePoints.removeAll { $0.trackNumber != seekTrack?.number }
+        hasCues = !cuePoints.isEmpty
         reader.seek(to: firstClusterOffset)
     }
 
@@ -692,7 +701,7 @@ final class MKVDemuxer {
             guard id == EBML.cuePoint else { reader.skip(size); continue }
             let pointEnd = reader.position + size
             var timeTicks: Int64 = -1
-            var clusterPos: Int64 = -1
+            var positions: [(track: UInt64, clusterPos: Int64)] = []
             while reader.position < pointEnd {
                 let (cid, csize) = try readChildHeader()
                 switch cid {
@@ -700,25 +709,33 @@ final class MKVDemuxer {
                     timeTicks = try readInt64(csize)
                 case EBML.cueTrackPositions:
                     let posEnd = reader.position + csize
+                    var trackNumber: UInt64 = 0
+                    var clusterPos: Int64 = -1
                     while reader.position < posEnd {
                         let (kid, ksize) = try readChildHeader()
                         switch kid {
+                        case EBML.cueTrack:
+                            trackNumber = try readUInt(ksize)
                         case EBML.cueClusterPosition:
-                            // Keep the FIRST track's position per point — video
-                            // cues carry the keyframe clusters.
-                            if clusterPos < 0 { clusterPos = try readInt64(ksize) }
-                            else { reader.skip(ksize) }
+                            clusterPos = try readInt64(ksize)
                         default: reader.skip(ksize)
                         }
+                    }
+                    if trackNumber > 0, clusterPos >= 0 {
+                        positions.append((trackNumber, clusterPos))
                     }
                 default:
                     reader.skip(csize)
                 }
             }
-            if timeTicks >= 0, clusterPos >= 0 {
+            if timeTicks >= 0 {
                 let (timeNs, overflow) = timeTicks.multipliedReportingOverflow(by: Int64(clamping: timestampScale))
                 if !overflow {
-                    cuePoints.append((timeNs: timeNs, clusterOffset: segmentDataStart + clusterPos))
+                    for position in positions {
+                        cuePoints.append((timeNs: timeNs,
+                                          clusterOffset: segmentDataStart + position.clusterPos,
+                                          trackNumber: position.track))
+                    }
                 }
             }
         }
@@ -944,7 +961,7 @@ final class MKVDemuxer {
                                      durationNs: frameDurNs,
                                      keyframe: keyframe,
                                      discardPaddingNs: i == frameSizes.count - 1 ? discardPaddingNs : 0,
-                                     data: data))
+                                     data: data, timestampResolutionNs: scale))
             frameOffsetNs += frameDurNs ?? 0
         }
         reader.seek(to: blockEnd)
@@ -1107,6 +1124,23 @@ final class MKVDemuxer {
             return ns(samples: Double(blocks * 256), rate: sampleRate)
         case let s where s == "A_AAC" || s.hasPrefix("A_AAC/"):
             return ns(samples: 1024, rate: sampleRate)
+        case "A_DTS":
+            // DTS lacing stores several core frames in one Matroska block.
+            // Give each lace its actual duration so their packet PTS values
+            // advance instead of overlapping in the PCM renderer.
+            guard data.count >= 6 else { return nil }
+            let b = [UInt8](data.prefix(6))
+            let header: (UInt8, UInt8)?
+            if b[0] == 0x7F && b[1] == 0xFE && b[2] == 0x80 && b[3] == 0x01 {
+                header = (b[4], b[5])       // 16-bit big-endian core
+            } else if b[0] == 0xFE && b[1] == 0x7F && b[2] == 0x01 && b[3] == 0x80 {
+                header = (b[5], b[4])       // 16-bit little-endian core
+            } else {
+                header = nil                // 14-bit packing: leave duration unknown
+            }
+            guard let (b4, b5) = header else { return nil }
+            let pcmBlocks = ((((Int(b4) & 0x01) << 6) | (Int(b5) >> 2)) + 1) * 32
+            return ns(samples: Double(pcmBlocks), rate: sampleRate)
         case "A_FLAC":
             return nil  // variable; caller falls back to next-pts deltas
         case "A_OPUS":

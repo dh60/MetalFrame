@@ -215,6 +215,29 @@ func splitDolbySyncframes(codecID: String, data: Data) -> [Data] {
 
 // MARK: - Pipeline
 
+// PCM time advances by whole samples, not by rounded container timestamps.
+// Re-anchor only for a real discontinuity (or a rate change), preserving gaps
+// from missing packets while removing Matroska's millisecond rounding jitter.
+struct DTSPCMTimeline {
+    private var nextPTS = CMTime.invalid
+
+    mutating func reset() { nextPTS = .invalid }
+
+    mutating func timestamp(packetPTS: CMTime, sampleRate: Int,
+                            sampleCount: Int, resolutionNs: Int64) -> CMTime {
+        let rate = CMTimeScale(sampleRate)
+        let sampleNs = Int64(ceil(1e9 / Double(sampleRate)))
+        let tolerance = Double(max(resolutionNs, 1) + sampleNs) / 1e9
+        if !nextPTS.isNumeric || nextPTS.timescale != rate
+            || abs(CMTimeSubtract(packetPTS, nextPTS).seconds) > tolerance {
+            nextPTS = packetPTS.convertScale(rate, method: .default)
+        }
+        let pts = nextPTS
+        nextPTS = CMTimeAdd(pts, CMTime(value: Int64(sampleCount), timescale: rate))
+        return pts
+    }
+}
+
 final class AudioPipeline {
     let synchronizer = AVSampleBufferRenderSynchronizer()
     private let renderer = AVSampleBufferAudioRenderer()
@@ -232,6 +255,7 @@ final class AudioPipeline {
     // from the first decoded frame (rate/layout come from the bitstream).
     private var dtsDecoder: DTSDecoder?
     private var dtsFormatKey: UInt64 = 0
+    private var dtsTimeline = DTSPCMTimeline()
     // Trim bookkeeping: the first buffer after a configure/flush gets
     // TrimDurationAtStart for codec delay (Opus pre-skip) and seek alignment.
     private var pendingStartTrimNs: Int64 = 0
@@ -243,6 +267,10 @@ final class AudioPipeline {
         return lastEnqueuedEndNsValue
     }
     var rendererError: Error? { renderer.error }
+    var volume: Float {
+        get { renderer.volume }
+        set { renderer.volume = max(0, min(1, newValue)) }
+    }
     // Fired (on the pump queue) when the OS flushed the renderer on its own —
     // an output-device change — and everything queued is gone. The engine
     // re-primes from the current time.
@@ -284,6 +312,7 @@ final class AudioPipeline {
         self.format = format
         self.dtsDecoder = isDTS ? DTSDecoder() : nil
         self.dtsFormatKey = 0
+        self.dtsTimeline.reset()
         fifo.removeAll()
         eof = false
         firstBufferPending = true
@@ -335,6 +364,7 @@ final class AudioPipeline {
         pumpQueue.sync {}  // drain any in-flight pump before flushing the renderer
         renderer.flush()
         dtsDecoder?.reset()   // safe: pump drained above, and closed blocks new work
+        dtsTimeline.reset()
         lock.lock()
         firstBufferPending = false
         lastEnqueuedEndNsValue = Int64.min
@@ -465,7 +495,7 @@ final class AudioPipeline {
     }
 
     private func makePCMSampleBuffer(pcm: [Float], format: CMAudioFormatDescription,
-                                     frameCount: Int, ptsNs: Int64) throws -> CMSampleBuffer {
+                                     frameCount: Int, pts: CMTime) throws -> CMSampleBuffer {
         let byteCount = pcm.count * MemoryLayout<Float>.size
         var blockBuffer: CMBlockBuffer?
         var status = CMBlockBufferCreateWithMemoryBlock(
@@ -483,7 +513,7 @@ final class AudioPipeline {
         status = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
             allocator: kCFAllocatorDefault, dataBuffer: blockBuffer,
             formatDescription: format, sampleCount: frameCount,
-            presentationTimeStamp: CMTime(value: ptsNs, timescale: 1_000_000_000),
+            presentationTimeStamp: pts,
             packetDescriptions: nil, sampleBufferOut: &sb)
         guard status == noErr, let sb else {
             throw MKVError.io("PCM CMSampleBuffer failed (\(status))")
@@ -508,12 +538,15 @@ final class AudioPipeline {
             let fmt = format
             lock.unlock()
             guard let fmt else { continue }
-            let ptsNs = packet.ptsNs + offsetNs
+            let pts = dtsTimeline.timestamp(
+                packetPTS: CMTime(value: packet.ptsNs + offsetNs, timescale: 1_000_000_000),
+                sampleRate: f.sampleRate, sampleCount: f.samplesPerChannel,
+                resolutionNs: packet.timestampResolutionNs)
             let durNs = Int64(f.samplesPerChannel) * 1_000_000_000 / Int64(f.sampleRate)
             offsetNs += durNs
             guard let sb = try? makePCMSampleBuffer(pcm: f.pcm, format: fmt,
                                                     frameCount: f.samplesPerChannel,
-                                                    ptsNs: ptsNs) else { continue }
+                                                    pts: pts) else { continue }
             if isFirst, i == 0, startTrimNs > 0 {
                 let trim = CMTime(value: startTrimNs, timescale: 1_000_000_000)
                 CMSetAttachment(sb, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
@@ -522,7 +555,10 @@ final class AudioPipeline {
             }
             renderer.enqueue(sb)
             lock.lock()
-            lastEnqueuedEndNsValue = max(lastEnqueuedEndNsValue, ptsNs + durNs)
+            let end = CMTimeAdd(pts, CMTime(value: Int64(f.samplesPerChannel),
+                                          timescale: CMTimeScale(f.sampleRate)))
+            lastEnqueuedEndNsValue = max(lastEnqueuedEndNsValue,
+                                        end.convertScale(1_000_000_000, method: .default).value)
             lock.unlock()
         }
     }
