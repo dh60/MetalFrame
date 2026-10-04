@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # Version stamped into Info.plist; CI can override it for release builds.
-VERSION="${VERSION:-0.3.0}"
+VERSION="${VERSION:-0.3.1}"
 
 # Clean build
 rm -rf MetalFrame.app

@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.1] - 2026-10-04
+
+### Fixed
+
+- Current-file and single-file playlist looping now prebuffer the next pass on
+  both playback engines, keeping video and audio running across file boundaries.
+- Native playback preserves continuous timestamps and resets DTS decoder history
+  at loop boundaries; delayed video frames are drained before the next pass.
+- Queued playback retains audio and subtitle selections across loops.
+- Replay resumes after the rewind completes; disabling looping removes queued
+  repeats and restores normal end-of-file behavior.
+- Video details and scale controls keep their intended width.
+
+### Verification
+
+- Added real playback regression checks for AAC and DTS Matroska loops and
+  AVPlayer loops, including pause, seek, loop-off, and single-file playlists.
+
+
 ## [0.3.0] - 2026-10-03
 
 Playlists, folder playback, volume controls, and fixes for DTS audio and slow
@@ -76,3 +95,5 @@ Matroska seeking. Changes since v0.2.7:
 Requires macOS 26 or later and Apple Silicon.
 
 [0.3.0]: https://github.com/dh60/MetalFrame/compare/v0.2.7...v0.3.0
+
+[0.3.1]: https://github.com/dh60/MetalFrame/compare/v0.3.0...v0.3.1

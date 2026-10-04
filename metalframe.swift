@@ -138,6 +138,7 @@ struct MetalView: View {
                     Text(renderer.info)
                     ScaleModePicker(selection: $renderer.scaleMode)
                 }
+                .fixedSize(horizontal: true, vertical: true)
                 .padding()
                 .glassEffect(in: .rect(cornerRadius: 30))
                 .padding()
@@ -165,6 +166,8 @@ struct MetalView: View {
                 .transition(.blurReplace)
             }
         }
+        .onChange(of: renderer.playlist.loopMode) { renderer.updateLooping() }
+        .onChange(of: renderer.playlist.files) { renderer.updateLooping() }
         .onContinuousHover { phase in
             switch phase {
             case .active:
@@ -599,6 +602,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     var frameEvent: MTLSharedEvent!
     var pendingFrameValue: UInt64 = 0
     var player: AVPlayer?
+    private var playerItemObservation: NSKeyValueObservation?
     var playerItem: AVPlayerItem?
     var videoOutput: AVPlayerItemVideoOutput?
     var textureCache: CVMetalTextureCache!
@@ -909,6 +913,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         f[11] = 0
     }
 
+    @MainActor
     func cycleSubtitles() {
         if let engine {
             let tracks = engine.subtitleTracks
@@ -936,16 +941,19 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         if selectedSubtitleIndex >= subtitleOptions.count {
             selectedSubtitleIndex = -1
             playerItem?.select(nil, in: group)
+            updateQueuedMediaSelection()
             subtitleText = ""
             statusLabel = "Subtitles: Off"
         } else {
             let option = subtitleOptions[selectedSubtitleIndex]
             playerItem?.select(option, in: group)
+            updateQueuedMediaSelection()
             let lang = option.displayName
             statusLabel = "Subtitles: \(lang)"
         }
     }
 
+    @MainActor
     func cycleAudio() {
         if let engine {
             statusLabel = engine.cycleAudioTrack()
@@ -958,6 +966,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         selectedAudioIndex = (selectedAudioIndex + 1) % audioOptions.count
         let option = audioOptions[selectedAudioIndex]
         playerItem?.select(option, in: group)
+        updateQueuedMediaSelection()
         if audioOptions.count > 1 {
             statusLabel = "Audio \(selectedAudioIndex + 1)/\(audioOptions.count): \(option.displayName)"
         } else {
@@ -965,7 +974,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         }
     }
 
-    func seek(to time: Double) {
+    func seek(to time: Double, completion: (() -> Void)? = nil) {
         // duration is 0 until the AVPlayer path's async load lands (and stays
         // 0 for containers without one) — only clamp against it when known.
         let upper = (duration > 0 && duration.isFinite) ? duration : .infinity
@@ -986,12 +995,13 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                     self.pendingSeekTime = nil
                     self.isSeeking = false
                     self.currentTime = clamped
+                    completion?()
                 }
             }
             return
         }
         let target = CMTime(seconds: clamped, preferredTimescale: 600)
-        player?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+        player?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
             Task { @MainActor in
                 guard let self, self.loadGeneration == generation,
                       self.seekRequestGeneration == request else { return }
@@ -999,6 +1009,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                     self.pendingSeekTime = nil
                     self.isSeeking = false
                     self.currentTime = clamped
+                    if finished { completion?() }
                 }
             }
         }
@@ -1174,12 +1185,37 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     private func restartCurrentFile(playing: Bool) {
         if let engine {
             engine.setPlaying(playing)
-        } else if let player {
-            if playing { player.play() } else { player.pause() }
+            setPlaybackActivity(playing)
+            seek(to: 0)
+            return
         }
-        setPlaybackActivity(playing)
-        seek(to: 0)
-        currentTime = 0
+        player?.pause()
+        setPlaybackActivity(false)
+        seek(to: 0) { [weak self] in
+            guard let self else { return }
+            if playing { self.player?.play() }
+            self.setPlaybackActivity(playing)
+        }
+    }
+
+    private var loopsCurrentFile: Bool {
+        playlist.loopMode == .current
+            || (playlist.loopMode == .playlist && playlist.files.count == 1)
+    }
+
+    @MainActor
+    func updateLooping() {
+        engine?.setLooping(loopsCurrentFile)
+        guard let queue = player as? AVQueuePlayer else { return }
+        queue.actionAtItemEnd = loopsCurrentFile ? .advance : .pause
+        if loopsCurrentFile, queue.items().count == 1, let item = queue.currentItem {
+            // Prepare the next item, including Metal/subtitle outputs, before
+            // EOF. The queue advances without a seek or a stopped playback clock.
+            let next = makePlayerItem(asset: item.asset)
+            queue.insert(next, after: item)
+        } else if !loopsCurrentFile {
+            for item in queue.items() where item !== queue.currentItem { queue.remove(item) }
+        }
     }
 
     @MainActor
@@ -1239,6 +1275,9 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         engine?.shutdown()
         engine = nil
         player?.pause()
+        playerItemObservation?.invalidate()
+        playerItemObservation = nil
+        (player as? AVQueuePlayer)?.removeAllItems()
         player = nil
         // Detach the previous AVPlayer graph completely: a lingering status
         // observer would pop the old item's failure over the new file, and the
@@ -1306,6 +1345,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             return
         }
         engine = newEngine
+        newEngine.setLooping(loopsCurrentFile)
         newEngine.volume = Float(volumePercent) / 100
         setupMetalCore(view: view)
         guard errorMessage == nil else {
@@ -1342,60 +1382,36 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         guard errorMessage == nil else { return }
 
         let asset = AVURLAsset(url: url)
-        playerItem = AVPlayerItem(asset: asset)
-
-        // Surface unplayable formats (.webm, .avi, broken codec, etc.) instead of a
-        // silent black screen. AVPlayerItem.status transitions to .failed when the
-        // asset can't be loaded; .error carries the diagnostic.
-        itemStatusObservation = playerItem?.observe(\.status, options: [.new]) { [weak self] item, _ in
-            guard let self, item.status == .failed else { return }
-            let msg = item.error?.localizedDescription ?? "Unknown decode error"
+        let item = makePlayerItem(asset: asset)
+        let queue = AVQueuePlayer(items: [item])
+        player = queue
+        queue.volume = Float(volumePercent) / 100
+        adoptPlayerItem(item)
+        playerItemObservation = queue.observe(\.currentItem, options: [.new]) { [weak self, weak queue] _, _ in
             Task { @MainActor in
-                guard self.playerItem === item else { return }
-                self.fileFailed("Cannot play this file: \(msg)")
+                guard let self, let queue, self.player === queue,
+                      let current = queue.currentItem else { return }
+                self.adoptPlayerItem(current)
+                self.updateLooping()
             }
         }
+        updateLooping()
 
         if let endObservation { NotificationCenter.default.removeObserver(endObservation) }
         endObservation = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: playerItem,
-            queue: .main
+            forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main
         ) { [weak self] notification in
             guard let self else { return }
             MainActor.assumeIsolated {
-                guard let item = notification.object as? AVPlayerItem,
-                      self.playerItem === item else { return }
+                guard let ended = notification.object as? AVPlayerItem,
+                      self.player?.currentItem === ended else { return }
+                // A queued loop already has its successor ready. EOF must not
+                // also seek/restart the producer while the queue is advancing.
+                if self.loopsCurrentFile,
+                   let queue = self.player as? AVQueuePlayer, queue.items().count > 1 { return }
                 self.playbackEnded()
             }
         }
-
-        // Bi-planar YUV intake. CVPixelBuffer.h:232 says the format-type key takes a
-        // CFArray of CFNumbers, so AVF picks the closest match to the source — we
-        // do YUV→RGB + chroma upsample + transfer-function decode ourselves in the
-        // intake shader, instead of letting AVF pre-mix RGBA half-float for us.
-        let pixelBufferAttributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: [
-                Int(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
-                Int(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange),
-                Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-                Int(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
-            ],
-            kCVPixelBufferMetalCompatibilityKey as String: true
-        ]
-
-        let newVideoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: pixelBufferAttributes)
-        videoOutput = newVideoOutput
-        playerItem?.add(newVideoOutput)
-
-        let newLegibleOutput = AVPlayerItemLegibleOutput()
-        newLegibleOutput.setDelegate(self, queue: .main)
-        newLegibleOutput.suppressesPlayerRendering = true
-        legibleOutput = newLegibleOutput
-        playerItem?.add(newLegibleOutput)
-
-        player = AVPlayer(playerItem: playerItem)
-        player?.volume = Float(volumePercent) / 100
 
         // Every write below checks the load generation: these loads can
         // outlive a quick switch to another file.
@@ -1496,7 +1512,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                     guard self.loadGeneration == generation else { return }
                     self.subtitleGroup = group
                     self.subtitleOptions = group.options
-                    self.playerItem?.select(nil, in: group)
+                    self.updateQueuedMediaSelection()
                 }
             }
             if let group = try? await asset.loadMediaSelectionGroup(for: .audible) {
@@ -1512,9 +1528,70 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                        let idx = group.options.firstIndex(of: current) {
                         self.selectedAudioIndex = idx
                     }
+                    self.updateQueuedMediaSelection()
                 }
             }
         }
+    }
+
+    @MainActor
+    private func makePlayerItem(asset: AVAsset) -> AVPlayerItem {
+        let item = AVPlayerItem(asset: asset)
+        // Keep YUV/HDR buffers available for Metal on every queued copy.
+        let attributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: [
+                Int(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange),
+                Int(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange),
+                Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                Int(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+            ],
+            kCVPixelBufferMetalCompatibilityKey as String: true
+        ]
+        item.add(AVPlayerItemVideoOutput(pixelBufferAttributes: attributes))
+        let subtitles = AVPlayerItemLegibleOutput()
+        subtitles.setDelegate(self, queue: .main)
+        subtitles.suppressesPlayerRendering = true
+        item.add(subtitles)
+        applyMediaSelection(to: item)
+        return item
+    }
+
+    @MainActor
+    private func applyMediaSelection(to item: AVPlayerItem) {
+        if let group = subtitleGroup {
+            let option = subtitleOptions.indices.contains(selectedSubtitleIndex)
+                ? subtitleOptions[selectedSubtitleIndex] : nil
+            item.select(option, in: group)
+        }
+        if let group = audioGroup, audioOptions.indices.contains(selectedAudioIndex) {
+            item.select(audioOptions[selectedAudioIndex], in: group)
+        }
+    }
+
+    @MainActor
+    private func adoptPlayerItem(_ item: AVPlayerItem) {
+        guard playerItem !== item else { return }
+        playerItem = item
+        videoOutput = item.outputs.compactMap { $0 as? AVPlayerItemVideoOutput }.first
+        legibleOutput = item.outputs.compactMap { $0 as? AVPlayerItemLegibleOutput }.first
+        subtitleText = ""
+        currentTime = 0
+        seekDisplayFloor = nil
+        lastPulledItemTime = -1
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            guard item.status == .failed else { return }
+            Task { @MainActor in
+                guard let self, self.playerItem === item else { return }
+                self.fileFailed("Cannot play this file: \(item.error?.localizedDescription ?? "Unknown decode error")")
+            }
+        }
+    }
+
+    @MainActor
+    private func updateQueuedMediaSelection() {
+        guard let queue = player as? AVQueuePlayer else { return }
+        for item in queue.items() { applyMediaSelection(to: item) }
     }
 
     // Kicks off playback once the render pipelines exist — whichever producer
@@ -2048,16 +2125,19 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 let text = engine.subtitleText(atMediaTimeNs: mediaNs, trackIndex: selectedSubtitleIndex)
                 if text != subtitleText { subtitleText = text }
             }
-        } else if let output = videoOutput, let item = playerItem {
-            let time = output.itemTime(forHostTime: pullHostTime)
-            let now = item.currentTime().seconds
-            updatePlaybackTime(now)
-            var displayTime = CMTime.invalid
-            if !isSeeking,
-               output.hasNewPixelBuffer(forItemTime: time),
-               let pixelBuffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &displayTime) {
-                pulledBuffer = pixelBuffer
-                if displayTime.isNumeric { pulledPts = displayTime.seconds }
+        } else {
+            if let current = player?.currentItem { adoptPlayerItem(current) }
+            if let output = videoOutput, let item = playerItem {
+                let time = output.itemTime(forHostTime: pullHostTime)
+                let now = item.currentTime().seconds
+                updatePlaybackTime(now)
+                var displayTime = CMTime.invalid
+                if !isSeeking,
+                   output.hasNewPixelBuffer(forItemTime: time),
+                   let pixelBuffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &displayTime) {
+                    pulledBuffer = pixelBuffer
+                    if displayTime.isNumeric { pulledPts = displayTime.seconds }
+                }
             }
         }
 
@@ -2509,6 +2589,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
     }
 
     func legibleOutput(_ output: AVPlayerItemLegibleOutput, didOutputAttributedStrings strings: [NSAttributedString], nativeSampleBuffers: [Any], forItemTime itemTime: CMTime) {
+        guard output === legibleOutput else { return }
         subtitleText = strings.map { $0.string }.joined(separator: "\n")
     }
 }

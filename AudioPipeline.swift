@@ -244,7 +244,7 @@ final class AudioPipeline {
     private let pumpQueue = DispatchQueue(label: "metalframe.audio.pump")
 
     private let lock = NSCondition()
-    private var fifo: [MKVPacket] = []
+    private var fifo: [(packet: MKVPacket, startingLoop: Bool)] = []
     private var closed = false
     private var eof = false
     private static let fifoCapacity = 256
@@ -322,7 +322,7 @@ final class AudioPipeline {
     }
 
     // Demux thread: bounded blocking push (the engine's audio backpressure).
-    func enqueue(_ packet: MKVPacket) {
+    func enqueue(_ packet: MKVPacket, startingLoop: Bool = false) {
         lock.lock()
         while fifo.count >= Self.fifoCapacity && !closed {
             lock.wait()
@@ -331,7 +331,7 @@ final class AudioPipeline {
             lock.unlock()
             return
         }
-        fifo.append(packet)
+        fifo.append((packet, startingLoop))
         lock.unlock()
         pumpQueue.async { [weak self] in self?.pump() }
     }
@@ -402,13 +402,17 @@ final class AudioPipeline {
                 lock.unlock()
                 return
             }
-            let packet = fifo.removeFirst()
-            let isFirst = firstBufferPending
-            let startTrim = pendingStartTrimNs
+            let entry = fifo.removeFirst()
+            let packet = entry.packet
+            let isFirst = firstBufferPending || entry.startingLoop
+            let startTrim = entry.startingLoop ? Int64(track.codecDelayNs) : pendingStartTrimNs
             if firstBufferPending { firstBufferPending = false }
             lock.broadcast()
             lock.unlock()
 
+            // Reset codec history at the file boundary without flushing the
+            // renderer or disturbing the continuous PCM presentation clock.
+            if entry.startingLoop { dtsDecoder?.reset() }
             if isDTS {
                 enqueueDTS(packet: packet, isFirst: isFirst, startTrimNs: startTrim)
                 continue
