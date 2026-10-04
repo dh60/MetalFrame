@@ -19,8 +19,12 @@ import CoreVideo
 
 // Bounded blocking queue for compressed video packets: demux → decode thread.
 final class BoundedPacketQueue {
+    enum Entry {
+        case packet(MKVPacket)
+        case loopBoundary
+    }
     private let condition = NSCondition()
-    private var items: [MKVPacket] = []
+    private var items: [Entry] = []
     private var closed = false
     private var eof = false
     private let capacity: Int
@@ -30,7 +34,7 @@ final class BoundedPacketQueue {
     }
 
     // Blocks while full; false once closed.
-    func push(_ item: MKVPacket) -> Bool {
+    func push(_ item: Entry) -> Bool {
         condition.lock()
         defer { condition.unlock() }
         while items.count >= capacity && !closed {
@@ -43,7 +47,7 @@ final class BoundedPacketQueue {
     }
 
     // Blocks while empty; nil once closed, or drained after EOF.
-    func pop() -> MKVPacket? {
+    func pop() -> Entry? {
         condition.lock()
         defer { condition.unlock() }
         while items.isEmpty && !closed && !eof {
@@ -135,6 +139,9 @@ final class PlaybackEngine {
     private var streamEndNs = Int64.max        // max(video end, audio end) once EOF seen
     private var endFired = false
     private var shutdownRequested = false
+    private var looping = false
+    private var started = false
+    private var loopSpanNs: Int64 = 0
     // True from restart() entry until the new run's setRate re-anchors the
     // timebase. pullFrame returns nil during this window — otherwise draw()
     // keeps pulling against the STALE timebase (e.g. ~EOF time) and eats the
@@ -200,7 +207,7 @@ final class PlaybackEngine {
             guard let self else { return }
             self.controlQueue.async {
                 guard !self.stateLock.withLock({ self.shutdownRequested }) else { return }
-                self.restart(atNs: self.currentTimeNs(), reconfigureAudio: nil)
+                self.restart(atNs: Int64(self.currentTimeSeconds() * 1e9), reconfigureAudio: nil)
             }
         }
     }
@@ -208,7 +215,7 @@ final class PlaybackEngine {
     // MARK: - Public control surface
 
     func start(playing: Bool) {
-        stateLock.withLock { desiredPlaying = playing }
+        stateLock.withLock { desiredPlaying = playing; started = true }
         controlQueue.async { [self] in
             let status = selectInitialAudioTrack()
             if let status {
@@ -232,6 +239,21 @@ final class PlaybackEngine {
     func setPlaying(_ playing: Bool) {
         stateLock.withLock { desiredPlaying = playing }
         synchronizer.rate = playing ? 1 : 0
+    }
+
+    func setLooping(_ enabled: Bool) {
+        let reprime = stateLock.withLock { () -> Bool in
+            guard looping != enabled else { return false }
+            looping = enabled
+            // Drop already-prefetched repetitions when disabling, or reopen
+            // a drained demuxer when looping is enabled near EOF.
+            return started && (demuxEOF || loopSpanNs > 0)
+        }
+        if reprime {
+            controlQueue.async { [self] in
+                restart(atNs: Int64(currentTimeSeconds() * 1e9), reconfigureAudio: nil)
+            }
+        }
     }
 
     func seek(toSeconds target: Double, completion: (() -> Void)? = nil) {
@@ -264,7 +286,7 @@ final class PlaybackEngine {
             return (next, audioTrackLabel(index: next))
         }
         controlQueue.async { [self] in
-            let nowNs = currentTimeNs()
+            let nowNs = Int64(currentTimeSeconds() * 1e9)
             restart(atNs: nowNs, reconfigureAudio: nextIndex)
         }
         return label
@@ -305,11 +327,14 @@ final class PlaybackEngine {
 
     func currentTimeSeconds() -> Double {
         let t = CMTimebaseGetTime(synchronizer.timebase)
-        return t.isNumeric ? t.seconds : 0
+        let span = stateLock.withLock { loopSpanNs }
+        let seconds = t.isNumeric ? t.seconds : 0
+        return span > 0 ? max(0, seconds).truncatingRemainder(dividingBy: Double(span) / 1e9) : seconds
     }
 
     private func currentTimeNs() -> Int64 {
-        Int64(currentTimeSeconds() * 1e9)
+        let t = CMTimebaseGetTime(synchronizer.timebase)
+        return t.isNumeric ? t.convertScale(1_000_000_000, method: .default).value : 0
     }
 
     // Newest decoded frame due at or before the given media time. Nil means
@@ -421,6 +446,7 @@ final class PlaybackEngine {
             streamEndNs = Int64.max
             endFired = false
             audioSkipBeforeNs = targetNs - preRoll
+            loopSpanNs = 0
         }
         launchRun(fromNs: targetNs, initialStart: false)
     }
@@ -517,6 +543,9 @@ final class PlaybackEngine {
     private func demuxLoop(run: RunToken) {
         var maxVideoEndNs: Int64 = 0
         var maxAudioEndNs: Int64 = 0
+        var offsetNs: Int64 = 0
+        var sawVideo = false
+        var firstLoopAudio = false
         while !run.stopped {
             let packet: MKVPacket?
             do {
@@ -527,30 +556,54 @@ final class PlaybackEngine {
                 packet = nil
             }
             guard let packet else {
+                let span = max(maxVideoEndNs, maxAudioEndNs)
+                let repeatFile = stateLock.withLock { () -> Bool in
+                    guard looping, sawVideo, span > 0, !run.stopped else { return false }
+                    loopSpanNs = span
+                    return true
+                }
+                if repeatFile {
+                    // Keep audio, decoded frames, and the clock running. The
+                    // next pass is decoded ahead with monotonically rising PTS.
+                    guard videoQueue.push(.loopBoundary) else { return }
+                    offsetNs += span
+                    demuxer.seek(toNs: 0)
+                    sawVideo = false
+                    firstLoopAudio = true
+                    continue
+                }
                 stateLock.withLock {
                     demuxEOF = true
-                    streamEndNs = max(maxVideoEndNs, maxAudioEndNs)
+                    streamEndNs = offsetNs + span
                 }
                 videoQueue.markEOF()
                 audioPipeline.markEOF()
                 return
             }
             guard let track = demuxer.track(number: packet.trackNumber) else { continue }
+            let shifted = MKVPacket(trackNumber: packet.trackNumber, ptsNs: packet.ptsNs + offsetNs,
+                                    durationNs: packet.durationNs, keyframe: packet.keyframe,
+                                    discardPaddingNs: packet.discardPaddingNs, data: packet.data,
+                                    timestampResolutionNs: packet.timestampResolutionNs)
             switch track.type {
             case .video where track.number == videoTrack.number:
-                maxVideoEndNs = max(maxVideoEndNs, packet.ptsNs + (packet.durationNs ?? 0))
-                if !videoQueue.push(packet) { return }
+                sawVideo = true
+                let frameDuration = packet.durationNs ?? track.defaultDurationNs.flatMap { Int64(exactly: $0) }
+                    ?? 41_666_667
+                maxVideoEndNs = max(maxVideoEndNs, packet.ptsNs + frameDuration)
+                if !videoQueue.push(.packet(shifted)) { return }
             case .audio:
                 let (selected, skipBefore) = stateLock.withLock { (selectedAudioTrackNumber, audioSkipBeforeNs) }
                 if track.number == selected {
                     let endNs = packet.ptsNs + (packet.durationNs ?? 0)
-                    maxAudioEndNs = max(maxAudioEndNs, endNs)
-                    if endNs >= skipBefore {
-                        audioPipeline.enqueue(packet)
+                    maxAudioEndNs = max(maxAudioEndNs, endNs - max(0, packet.discardPaddingNs))
+                    if endNs + offsetNs >= skipBefore {
+                        audioPipeline.enqueue(shifted, startingLoop: firstLoopAudio)
+                        firstLoopAudio = false
                     }
                 }
             case .subtitle:
-                handleSubtitlePacket(packet, track: track)
+                handleSubtitlePacket(shifted, track: track)
             default:
                 break
             }
@@ -558,8 +611,11 @@ final class PlaybackEngine {
     }
 
     private func videoDecodeLoop(run: RunToken) {
-        while !run.stopped, let packet = videoQueue.pop() {
-            videoPipeline.decode(packet)
+        while !run.stopped, let entry = videoQueue.pop() {
+            switch entry {
+            case .packet(let packet): videoPipeline.decode(packet)
+            case .loopBoundary: videoPipeline.finish()
+            }
         }
         if !run.stopped {
             // EOF: drain in-flight VT frames + the reorder tail.

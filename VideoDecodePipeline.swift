@@ -564,6 +564,7 @@ final class VideoDecodePipeline {
     // the reorder heap into the queue in presentation order.
     func finish() {
         if let session {
+            VTDecompressionSessionFinishDelayedFrames(session)
             VTDecompressionSessionWaitForAsynchronousFrames(session)
         }
         var remaining: [DecodedFrame] = []
