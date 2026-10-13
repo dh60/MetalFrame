@@ -31,6 +31,7 @@ videos from the playlist. Choose shuffle and repeat modes in the controls or the
 | Left / Right | Back / forward 10 seconds |
 | Up / Down | Volume up / down 10% |
 | Q / W | Previous / next file |
+| Hold Delete, press Return | Move current file to Trash and play the next one |
 | P | Show / hide playlist |
 | F | Fullscreen |
 | S | Cycle subtitle tracks |
