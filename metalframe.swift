@@ -70,6 +70,7 @@ struct MetalView: View {
     @State private var didReceiveURL = false
     @State private var importFolder = false
     @State private var appendFiles = false
+    @State private var deleteHeld = false
 
     private var importTypes: [UTType] {
         if importFolder { return [.folder] }
@@ -269,6 +270,24 @@ struct MetalView: View {
             if !renderer.statusLabel.isEmpty { flashStatusOverlay() }
         }
         .onKeyPress("f") { NSApplication.shared.keyWindow?.toggleFullScreen(nil); return .handled }
+        // Delete+Return trashes the current file: hold Delete, then press
+        // Return. Requiring the chord keeps a stray keypress from deleting.
+        // The Mac Delete key reports U+007F; KeyEquivalent.delete is U+0008
+        // and never matches it.
+        .onKeyPress(KeyEquivalent("\u{7F}"), phases: .all) { press in
+            deleteHeld = press.phase != .up
+            return .handled
+        }
+        .onKeyPress(.return) {
+            guard deleteHeld else { return .ignored }
+            renderer.trashCurrentFile()
+            return .handled
+        }
+        // A Delete key-up sent to another app never reaches us; don't leave
+        // the chord armed after switching away.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { _ in
+            deleteHeld = false
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
             // Native fullscreen already hides the menu bar / Dock via auto-hide, which
             // reveals them on mouse-to-edge. Force the hide so we get a closer-to-
@@ -412,7 +431,7 @@ struct PlaylistPanel: View {
                     }
                 }
             }
-            Text("Q Previous · W Next · P Playlist")
+            Text("Q Previous · W Next · P Playlist · Delete+Return Trash")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -1150,6 +1169,21 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             pendingOpenURL = nil
             tearDownPlayback()
         }
+    }
+
+    // Moves the playing file to the Trash, then drops it from the playlist,
+    // which advances to the file that followed it.
+    @MainActor
+    func trashCurrentFile() {
+        guard let url = playlist.currentURL else { return }
+        do {
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        } catch {
+            errorMessage = "Couldn't move \(url.lastPathComponent) to Trash: \(error.localizedDescription)"
+            return
+        }
+        removeFile(url)
+        statusLabel = "Moved \(url.lastPathComponent) to Trash"
     }
 
     // Keep the playlist intact while switching producers. Cold launches defer

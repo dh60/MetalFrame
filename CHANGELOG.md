@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2] - 2026-10-13
+
+### Added
+
+- Hold Delete and press Return to move the current file to the Trash and
+  continue with the next file in the playlist.
+
 ## [0.3.1] - 2026-10-04
 
 ### Fixed
