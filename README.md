@@ -10,6 +10,7 @@ A video player for macOS 26+ on Apple Silicon.
 
 - MKV, WebM, MP4, and MOV playback
 - HDR playback with optional tone mapping
+- Automatic cropping of black bars baked into the video
 - MetalFX upscaling and Lanczos downscaling
 - SRT and ASS subtitles in MKV files
 - Playlists and folder playback, including subfolders
@@ -37,6 +38,7 @@ videos from the playlist. Choose shuffle and repeat modes in the controls or the
 | S | Cycle subtitle tracks |
 | A | Cycle audio tracks |
 | T | Toggle HDR tone mapping |
+| C | Toggle automatic black-bar cropping |
 | I | Show video details and Off / Fit / Fill controls |
 | ⌘O | Open files, a folder, or a playlist |
 | ⇧⌘O | Open a folder |

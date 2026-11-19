@@ -270,6 +270,12 @@ struct MetalView: View {
             if !renderer.statusLabel.isEmpty { flashStatusOverlay() }
         }
         .onKeyPress("f") { NSApplication.shared.keyWindow?.toggleFullScreen(nil); return .handled }
+        .onKeyPress("c") {
+            renderer.autoCrop.toggle()
+            renderer.statusLabel = renderer.autoCrop ? "Black bar crop: auto" : "Black bar crop: off"
+            flashStatusOverlay()
+            return .handled
+        }
         // Delete+Return trashes the current file: hold Delete, then press
         // Return. Requiring the chord keeps a stray keypress from deleting.
         // The Mac Delete key reports U+007F; KeyEquivalent.delete is U+0008
@@ -661,6 +667,17 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             needsRedraw = true
         }
     }
+    // Black bars baked into the picture (4:3 pillarboxed in 16:9, scope
+    // letterboxed in 16:9) are detected and cropped in the intake pass, so
+    // fit/fill/MetalFX/EWA all see only the real picture. 'c' toggles.
+    let blackBars = BlackBarDetector()
+    var autoCrop = true {
+        didSet { needsRedraw = true }
+    }
+    // Coded luma size of the frame the Y/CbCr textures hold, and the crop the
+    // intake uniforms + linearTexture currently reflect.
+    private var sourceLumaSize = (width: 0, height: 0)
+    private var appliedCrop = BlackBarCrop()
     var currentTime: Double = 0
     var duration: Double = 0
     var colorspaceLabel = "sRGB"
@@ -930,6 +947,17 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         f[8] = rotation.columns.1.x; f[9] = rotation.columns.1.y
         f[10] = Float(transferFunction.rawValue)
         f[11] = 0
+    }
+
+    // Crop rect in normalized coded-frame coords (origin, size) at offset 96,
+    // after IntakeUniforms' tf/_pad. Kept apart from writeIntakeUniforms,
+    // which only reruns on pixel-format changes.
+    func writeIntakeCrop(_ crop: BlackBarCrop, lumaWidth w: Int, lumaHeight h: Int) {
+        let f = intakeUniformsBuffer.contents().advanced(by: 96).assumingMemoryBound(to: Float.self)
+        f[0] = Float(crop.left) / Float(w)
+        f[1] = Float(crop.top) / Float(h)
+        f[2] = Float(w - crop.left - crop.right) / Float(w)
+        f[3] = Float(h - crop.top - crop.bottom) / Float(h)
     }
 
     @MainActor
@@ -1670,6 +1698,8 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         rotationQuadrant = 0
         rotation = matrix_identity_float2x2
         displayAspect = 0
+        blackBars.reset()
+        sourceLumaSize = (0, 0)
         yTexture = nil
         cbcrTexture = nil
         linearTexture = nil
@@ -1732,8 +1762,8 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         }
         kernelLUT = lutTex
 
-        // Intake uniforms: float3x3 (48) + 3× float2 (24) + float2x2 (16) + 2× float (8) = 96,
-        // allocated at 112 for headroom. See IntakeUniforms in shader.
+        // Intake uniforms: float3x3 (48) + 3× float2 (24) + float2x2 (16) + 2× float (8)
+        // + float4 crop (16) = 112. See IntakeUniforms in shader.
         guard let uBuf = device.makeBuffer(length: 32, options: .storageModeShared),
               let iBuf = device.makeBuffer(length: 112, options: .storageModeShared),
               let alloc = device.makeCommandAllocator(),
@@ -1745,6 +1775,8 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         }
         uniformsBuffer = uBuf
         intakeUniformsBuffer = iBuf
+        writeIntakeCrop(BlackBarCrop(), lumaWidth: 1, lumaHeight: 1)
+        appliedCrop = BlackBarCrop()
         allocator = alloc
         intakeFence = intakeF
         commandBuffer = cmd
@@ -1778,7 +1810,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             struct Uniforms { float2 quadScale; float ratio; float tf; float2 tmPQ; float2 quadOffset; };
 
             // Intake uniforms — columns of float3x3 each padded to float4 stride
-            // (48 bytes), then 8/8/8/16/4/4 = 96 bytes total.
+            // (48 bytes), then 8/8/8/16/4/4/16 = 112 bytes total.
             struct IntakeUniforms {
                 float3x3 yuvToRgb;
                 float2 yScaleBias;     // Y' = sample * yScaleBias.x + yScaleBias.y
@@ -1787,6 +1819,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 float2x2 rotation;     // display texCoord → source texCoord, about (0.5, 0.5)
                 float tf;
                 float _pad;
+                float4 crop;           // picture rect in coded texCoords: origin.xy, size.zw
             };
 
             vertex VertexOut vertexShader(uint vid [[vertex_id]], constant Uniforms &u [[buffer(0)]]) {
@@ -1939,6 +1972,8 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 // 270° sources); rotate the coord about the center to sample the
                 // unrotated source planes.
                 float2 tc = u.rotation * (in.texCoord - 0.5) + 0.5;
+                // Then into the picture rect (black bars cropped away).
+                tc = u.crop.xy + tc * u.crop.zw;
 
                 // Luma: sampled at the corresponding integer luma pixel (1:1).
                 float lx = tc.x * lumaW;
@@ -2274,19 +2309,10 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 yTexture = yCV.flatMap { CVMetalTextureGetTexture($0) }
                 cbcrTexture = cCV.flatMap { CVMetalTextureGetTexture($0) }
 
-                // Linear-light intermediate at source resolution, display-oriented:
-                // dimensions swap for 90°/270° sources so everything downstream
-                // (EWA, MetalFX, fit/fill) sees an upright image. Realloc when the
-                // dimensions change (track metadata arriving, rare mid-stream shifts).
-                let rotated = rotationQuadrant % 2 == 1
-                let intakeW = rotated ? lumaH : lumaW
-                let intakeH = rotated ? lumaW : lumaH
-                if linearTexture?.width != intakeW || linearTexture?.height != intakeH {
-                    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: intakeW, height: intakeH, mipmapped: false)
-                    d.usage = [.renderTarget, .shaderRead]
-                    linearTexture = device.makeTexture(descriptor: d)
-                    scaler = nil
-                }
+                sourceLumaSize = (lumaW, lumaH)
+                let fullRange = curPixFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                    || curPixFmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+                _ = blackBars.observe(pixelBuffer, fullRange: fullRange, now: CACurrentMediaTime())
         }
 
         // No new frame due and nothing about the output changed — keep the last
@@ -2294,6 +2320,38 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         // link at panel-native cadence (e.g. 120 Hz for 23.976 content) most
         // ticks land here, so the render pipeline still runs at content rate.
         if pulledBuffer == nil && !needsRedraw { return }
+
+        // Linear-light intermediate at picture resolution (coded size minus
+        // any detected black bars), display-oriented: dimensions swap for
+        // 90°/270° sources so everything downstream (EWA, MetalFX, fit/fill)
+        // sees an upright, bar-free image. Realloc when the dimensions change
+        // (track metadata arriving, a crop being found, mid-stream shifts).
+        let crop = autoCrop ? blackBars.crop : BlackBarCrop()
+        if sourceLumaSize.width > 0 {
+            let (lumaW, lumaH) = sourceLumaSize
+            let picW = lumaW - crop.left - crop.right, picH = lumaH - crop.top - crop.bottom
+            let rotated = rotationQuadrant % 2 == 1
+            let intakeW = rotated ? picH : picW
+            let intakeH = rotated ? picW : picH
+            if linearTexture?.width != intakeW || linearTexture?.height != intakeH || crop != appliedCrop {
+                // A needsRedraw-only tick (crop toggled while paused) skipped
+                // the pull block's wait; the previous frame may still be
+                // reading the old texture and uniforms.
+                if pendingFrameValue > 0,
+                   !frameEvent.wait(untilSignaledValue: pendingFrameValue, timeoutMS: 1000) {
+                    needsRedraw = true
+                    return
+                }
+                if linearTexture?.width != intakeW || linearTexture?.height != intakeH {
+                    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: intakeW, height: intakeH, mipmapped: false)
+                    d.usage = [.renderTarget, .shaderRead]
+                    linearTexture = device.makeTexture(descriptor: d)
+                    scaler = nil
+                }
+                writeIntakeCrop(crop, lumaWidth: lumaW, lumaHeight: lumaH)
+                appliedCrop = crop
+            }
+        }
 
         guard let yTexture, let cbcrTexture, let linearTexture else { return }
         // The drawable is acquired only on ticks that actually render —
@@ -2308,9 +2366,16 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
         let viewportSize = CGSize(width: drawable.texture.width, height: drawable.texture.height)
         // PAR-corrected display aspect once track metadata is in (anamorphic DVD /
         // broadcast sources); the display-oriented texture's own aspect until then.
-        let imageAspect = displayAspect > 0
+        // A crop scales the aspect by the kept fraction of each coded axis
+        // (axes swap for 90°/270° sources, as displayAspect already does).
+        var imageAspect = displayAspect > 0
             ? displayAspect
             : CGFloat(inputTexture.width) / CGFloat(inputTexture.height)
+        if displayAspect > 0, !appliedCrop.isEmpty, sourceLumaSize.width > 0 {
+            let keepW = CGFloat(sourceLumaSize.width - appliedCrop.left - appliedCrop.right) / CGFloat(sourceLumaSize.width)
+            let keepH = CGFloat(sourceLumaSize.height - appliedCrop.top - appliedCrop.bottom) / CGFloat(sourceLumaSize.height)
+            imageAspect *= rotationQuadrant % 2 == 1 ? keepH / keepW : keepW / keepH
+        }
         let viewportAspect = viewportSize.width / viewportSize.height
 
         var targetSize: CGSize
@@ -2390,7 +2455,7 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
                 outputSize = CGSize(width: inputTexture.width, height: inputTexture.height)
             } else if let (_, output) = scaler {
                 let upRatio = Double(output.width) / Double(inputTexture.width)
-                scalingMode = String(format: "Upscaling %.2fx: MetalFX (filter choice ignored)", upRatio)
+                scalingMode = String(format: "Upscaling %.2fx: MetalFX spatial", upRatio)
                 outputSize = CGSize(width: output.width, height: output.height)
             } else {
                 let downRatio = max(Double(inputTexture.width) / Double(max(targetSize.width, 1)),
@@ -2441,7 +2506,15 @@ class Renderer: NSObject, MTKViewDelegate, AVPlayerItemLegibleOutputPushDelegate
             let statsLine = String(format: "\nFPS: %.1f · Dropped: %d · Vsync: %.0f Hz",
                                    measuredFPS, droppedFrames, vsyncHz)
             let engineLine = engine.map { "\nEngine: native \($0.containerLabel) · \($0.usingHardwareDecode ? "hardware" : "software") decode" } ?? ""
-            let newInfo = "Input: \(inputTexture.width)x\(inputTexture.height)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)\nColorspace: \(colorspaceLabel)\(edrLine)\(contentLine)\(sceneLine)\(tmLine)\(statsLine)\(engineLine)"
+            let cropLine: String
+            if !autoCrop {
+                cropLine = "\nBlack bars: crop off (c)"
+            } else if !appliedCrop.isEmpty {
+                cropLine = "\nBlack bars: cropped from \(sourceLumaSize.width)x\(sourceLumaSize.height)"
+            } else {
+                cropLine = ""
+            }
+            let newInfo = "Input: \(inputTexture.width)x\(inputTexture.height)\(cropLine)\nOutput: \(Int(outputSize.width))x\(Int(outputSize.height))\n\(scalingMode)\nColorspace: \(colorspaceLabel)\(edrLine)\(contentLine)\(sceneLine)\(tmLine)\(statsLine)\(engineLine)"
             if newInfo != info { info = newInfo }
         }
 
