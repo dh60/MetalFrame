@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.3] - 2026-11-18
+
+### Fixed
+
+- Files with 5.1 (or other multichannel) AAC audio no longer sit frozen at
+  0:00. The AAC magic cookie is now passed to CoreAudio as an MPEG-4
+  ES_Descriptor rather than a bare AudioSpecificConfig, and multichannel AAC
+  is tagged with AAC's native channel orders.
+
 ## [0.3.2] - 2026-10-13
 
 ### Added
