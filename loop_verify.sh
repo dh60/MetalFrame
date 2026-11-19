@@ -18,7 +18,7 @@ from pathlib import Path
 Path(sys.argv[1]).write_text(Path('metalframe.swift').read_text().replace(
     '@main\nstruct MetalFrame:', 'struct MetalFrame:', 1))
 PY
-swiftc -O "$WORK/renderer.swift" Playlist.swift MKVDemuxer.swift MP4Demuxer.swift \
+swiftc -O "$WORK/renderer.swift" Playlist.swift BlackBars.swift MKVDemuxer.swift MP4Demuxer.swift \
     HDRDynamicMetadata.swift VideoDecodePipeline.swift AudioPipeline.swift \
     PlaybackEngine.swift DTSDecoder.swift dts_tables.swift tests/LoopRegression.swift \
     -module-cache-path "$WORK/module-cache" -o "$WORK/verify" \

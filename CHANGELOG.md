@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.4] - 2026-11-18
+
+### Added
+
+- Black bars baked into the video (4:3 shows pillarboxed in 16:9, widescreen
+  films letterboxed in 16:9) are detected and cropped automatically, so Fit
+  and Fill work on the real picture. Press C to toggle; the info overlay
+  shows when a crop is active.
+
+### Fixed
+
+- The info overlay's MetalFX line no longer mentions a nonexistent filter
+  choice.
+
 ## [0.3.3] - 2026-11-18
 
 ### Fixed

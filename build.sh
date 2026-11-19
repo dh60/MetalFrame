@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # Version stamped into Info.plist; CI can override it for release builds.
-VERSION="${VERSION:-0.3.3}"
+VERSION="${VERSION:-0.3.4}"
 
 # Clean build
 rm -rf MetalFrame.app
@@ -14,6 +14,7 @@ mkdir -p MetalFrame.app/Contents/MacOS
 # Compile the Swift code + link (optimized — swiftc defaults to -Onone)
 swiftc metalframe.swift \
     Playlist.swift \
+    BlackBars.swift \
     MKVDemuxer.swift \
     MP4Demuxer.swift \
     HDRDynamicMetadata.swift \
