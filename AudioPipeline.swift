@@ -8,8 +8,8 @@ import AudioToolbox
 // the audio device disciplines the timebase, video is pulled against it.
 // Compressed packets pass straight through — AC3/E-AC-3 (JOC Atmos rides the
 // same ID), AAC, FLAC, and Opus all decode in the OS renderer (cookie shapes
-// verified by spike: AAC = raw AudioSpecificConfig, FLAC = bare 34-byte
-// STREAMINFO, Opus = OpusHead).
+// verified by spike: AAC = ESDS-wrapped AudioSpecificConfig, FLAC = bare
+// 34-byte STREAMINFO, Opus = OpusHead).
 
 func isPassthroughAudioCodec(_ codecID: String) -> Bool {
     switch codecID {
@@ -43,6 +43,26 @@ func audioCodecLabel(_ codecID: String) -> String {
     case let s where s.hasPrefix("A_PCM"): return "PCM"
     default: return codecID
     }
+}
+
+// The AAC magic cookie CoreAudio expects is an MPEG-4 ES_Descriptor (the
+// body of an MP4 'esds' box), not the bare AudioSpecificConfig MKV/MP4 carry.
+// A bare ASC happens to work for mono/stereo (the decoder falls back to its
+// defaults), but on macOS 27 multichannel AAC with a bare-ASC cookie is
+// accepted by AVSampleBufferAudioRenderer and then silently never renders —
+// the timebase never moves, so 5.1 AAC files sat frozen at 0:00. Same shape
+// AVFoundation builds for MP4 tracks.
+func aacESDSCookie(audioSpecificConfig asc: Data) -> Data {
+    func descriptor(_ tag: UInt8, _ body: Data) -> Data {
+        let n = body.count
+        return Data([tag, UInt8(0x80 | ((n >> 21) & 0x7F)), UInt8(0x80 | ((n >> 14) & 0x7F)),
+                     UInt8(0x80 | ((n >> 7) & 0x7F)), UInt8(n & 0x7F)]) + body
+    }
+    // DecoderConfigDescriptor: objectTypeIndication 0x40 (MPEG-4 audio),
+    // streamType 5 (audio) << 2 | 1 (reserved), then zero buffer/bitrates.
+    let decoderConfig = descriptor(0x04, Data([0x40, 0x15] + [UInt8](repeating: 0, count: 11))
+                                   + descriptor(0x05, asc))
+    return descriptor(0x03, Data([0x00, 0x01, 0x00]) + decoderConfig + descriptor(0x06, Data([0x02])))
 }
 
 private func parseAudioSpecificConfig(_ asc: Data) -> (sampleRate: Double, channels: Int?)? {
@@ -97,7 +117,7 @@ func makeAudioFormatDescription(track: MKVTrack) throws -> CMAudioFormatDescript
             asbd.mSampleRate = cfg.sampleRate
             if let ch = cfg.channels { asbd.mChannelsPerFrame = UInt32(ch) }
         }
-        cookie = track.codecPrivate  // raw AudioSpecificConfig
+        cookie = track.codecPrivate.map { aacESDSCookie(audioSpecificConfig: $0) }
     case "A_FLAC":
         asbd.mFormatID = kAudioFormatFLAC
         // CodecPrivate = "fLaC" magic + metadata blocks; STREAMINFO is the
@@ -121,7 +141,14 @@ func makeAudioFormatDescription(track: MKVTrack) throws -> CMAudioFormatDescript
     }
 
     var layout = AudioChannelLayout()
+    let isAAC = asbd.mFormatID == kAudioFormatMPEG4AAC
     switch Int(asbd.mChannelsPerFrame) {
+    // AAC's native channel orders (C first), as AVFoundation tags MP4 AAC.
+    case 3 where isAAC: layout.mChannelLayoutTag = kAudioChannelLayoutTag_AAC_3_0
+    case 4 where isAAC: layout.mChannelLayoutTag = kAudioChannelLayoutTag_AAC_4_0
+    case 5 where isAAC: layout.mChannelLayoutTag = kAudioChannelLayoutTag_AAC_5_0
+    case 6 where isAAC: layout.mChannelLayoutTag = kAudioChannelLayoutTag_AAC_5_1
+    case 8 where isAAC: layout.mChannelLayoutTag = kAudioChannelLayoutTag_AAC_7_1
     case 1: layout.mChannelLayoutTag = kAudioChannelLayoutTag_Mono
     case 2: layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo
     case 3: layout.mChannelLayoutTag = kAudioChannelLayoutTag_MPEG_3_0_A
